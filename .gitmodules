@@ -1,0 +1,6 @@
+[submodule "extern/fractalgen"]
+	path = extern/fractalgen
+	url = https://github.com/LTH14/fractalgen.git
+[submodule "extern/octgpt"]
+	path = extern/octgpt
+	url = https://github.com/octree-nn/octgpt.git
