@@ -201,6 +201,8 @@ class OctreeFractalGen(nn.Module):
                 num_heads=config.num_heads[idx],
                 cond_dim_in=config.cond_embed_dim,
                 cond_dim_out=config.cond_embed_dim,
+                patch_size=config.patch_size,
+                dilation=config.dilation,
                 attn_drop=config.attn_drop,
                 proj_drop=config.proj_drop,
                 grad_checkpointing=config.grad_checkpointing,

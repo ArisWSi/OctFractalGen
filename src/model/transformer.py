@@ -365,3 +365,189 @@ class TransformerBlock(nn.Module):
         # FFN 子 block
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
+
+
+# ---------------------------------------------------------------------------
+# Patch-wise Attention (OctFormer-style)
+# ---------------------------------------------------------------------------
+
+def patch_partition(
+    x: torch.Tensor, patch_size: int, use_swin: bool = False
+) -> torch.Tensor:
+    """将展平序列划分为 patch。
+
+    参数:
+        x: (B, N, C)
+        patch_size: 每个 patch 的 token 数
+        use_swin: 偏移 K//2（SWIN 风格）
+
+    返回:
+        (B, num_patches, patch_size, C)
+    """
+    B, N, C = x.shape
+    if use_swin:
+        shift = patch_size // 2
+        x = torch.cat([x.new_zeros(B, shift, C), x], dim=1)
+        N = N + shift
+    pad = (patch_size - (N % patch_size)) % patch_size
+    if pad > 0:
+        x = torch.cat([x, x.new_zeros(B, pad, C)], dim=1)
+    return x.view(B, -1, patch_size, C)
+
+
+def patch_reverse(
+    x: torch.Tensor, original_len: int, use_swin: bool = False
+) -> torch.Tensor:
+    """patch_partition 的逆操作。
+
+    参数:
+        x: (B, num_patches, patch_size, C)
+        original_len: 原始序列长度
+        use_swin: 与 patch_partition 保持一致
+
+    返回:
+        (B, original_len, C)
+    """
+    B, _, K, C = x.shape
+    x = x.reshape(B, -1, C)
+    if use_swin:
+        shift = K // 2
+        x = x[:, shift:shift + original_len]
+    else:
+        x = x[:, :original_len]
+    return x
+
+
+class PatchAttention(nn.Module):
+    """Patch 内自注意力 + 可选 dilation（OctFormer 风格）。
+
+    将序列划分为 patch，在 patch 内做双向注意力。
+    交替 dilation 模式连接跨 patch token。
+
+    参数:
+        dim: 特征维度
+        n_head: 注意力头数
+        patch_size: patch 大小
+        dilation: 膨胀率（1 = 标准，>1 = 跨 patch）
+        attn_drop: 注意力 dropout
+        proj_drop: 输出 dropout
+    """
+
+    def __init__(
+        self, dim: int, n_head: int, patch_size: int = 1024,
+        dilation: int = 1, attn_drop: float = 0.1, proj_drop: float = 0.1,
+    ):
+        super().__init__()
+        assert dim % n_head == 0
+        self.dim = dim
+        self.n_head = n_head
+        self.head_dim = dim // n_head
+        self.patch_size = patch_size
+        self.dilation = dilation
+
+        self.wqkv = nn.Linear(dim, dim * 3, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        self.attn_dropout_p = attn_drop
+        self.resid_dropout = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Patch-wise 注意力前向。
+
+        参数:
+            x: (B, N, C)
+
+        返回:
+            (B, N, C)
+        """
+        B, N, C = x.shape
+        K = self.patch_size
+        D = self.dilation
+        H = self.n_head
+        hd = self.head_dim
+
+        # QKV 投影
+        qkv = self.wqkv(x)                    # (B, N, 3*C)
+
+        # Partition + dilation
+        qkv = patch_partition(qkv, K)         # (B, P, K, 3*C)
+
+        if D > 1:
+            # Dilation: 重塑并转置以在 patch 间连接
+            # (B, P, K, 3C) → (B, K, P//D, D, 3C) → (B, P//D, K, D, 3C) → (B, P//D*K, 3C) → (B, P_new, K, 3C)
+            P = qkv.shape[1]
+            if P % D == 0:
+                qkv = qkv.view(B, P // D, D, K, -1)
+                qkv = qkv.transpose(2, 3).reshape(B, -1, K, 3 * C)
+            # 如果不能被 D 整除则跳过 dilation
+
+        P = qkv.shape[1]
+        # (B, P, K, 3C) → (B, P, K, 3, H, hd) → (3, B, P, H, K, hd)
+        qkv = qkv.view(B, P, K, 3, H, hd)
+        qkv = qkv.permute(3, 0, 1, 4, 2, 5)   # (3, B, P, H, K, hd)
+        q, k, v = qkv[0], qkv[1], qkv[2]       # 各 (B, P, H, K, hd)
+
+        # 缩放点积注意力（patch 内，双向）
+        q = q.reshape(B * P, H, K, hd)
+        k = k.reshape(B * P, H, K, hd)
+        v = v.reshape(B * P, H, K, hd)
+
+        y = nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=False,  # 双向（同深度 token）
+        )
+        y = y.view(B, P, H, K, hd)
+        y = y.permute(0, 1, 3, 2, 4).reshape(B, P, K, C)  # (B, P, K, C)
+
+        # 逆 dilation
+        if D > 1 and y.shape[1] != N // K + (1 if N % K else 0):
+            Q = y.shape[1]
+            orig_P = N // K + (1 if N % K else 0)
+            # 回退: (B, Q, K, C) → 恢复原始 patch 数
+            y = y.view(B, -1, D, K, C)
+            y = y.transpose(2, 3).reshape(B, orig_P, K, C)
+
+        # Reverse partition
+        y = patch_reverse(y, N)                # (B, N, C)
+
+        y = self.resid_dropout(self.wo(y))
+        return y
+
+
+class PatchTransformerBlock(nn.Module):
+    """OctFormer 风格的 Transformer block：PatchAttention + SwiGLU FFN。
+
+    预归一化布局:
+        x = x + PatchAttention(RMSNorm(x))
+        x = x + FFN(RMSNorm(x))
+
+    参数:
+        dim: 特征维度
+        n_head: 注意力头数
+        patch_size: patch 大小
+        dilation: 此 block 的膨胀率
+        mlp_drop: FFN dropout
+        attn_drop: 注意力 dropout
+        proj_drop: 投影 dropout
+        drop_path: DropPath rate
+    """
+
+    def __init__(
+        self, dim: int, n_head: int, patch_size: int = 1024,
+        dilation: int = 1, mlp_drop: float = 0.0,
+        attn_drop: float = 0.1, proj_drop: float = 0.1,
+        drop_path: float = 0.0, norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm(dim, eps=norm_eps)
+        self.attention = PatchAttention(
+            dim, n_head, patch_size, dilation, attn_drop, proj_drop)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+        self.feed_forward = FeedForward(dim, dropout=mlp_drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attention(self.attn_norm(x)))
+        x = x + self.drop_path(self.feed_forward(self.ffn_norm(x)))
+        return x

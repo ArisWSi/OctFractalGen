@@ -34,7 +34,10 @@ model:
   attn_drop: 0.1
   proj_drop: 0.1
   drop_path: 0.0
-  rope_base: 10000.0
+
+  # Patch attention (OctFormer-style)
+  patch_size: 1024               # 0 = full attention, >0 = patch-wise
+  dilation: 4                    # cross-patch connection rate
 
   # Condition (unconditional for first run)
   num_classes: 1

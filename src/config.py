@@ -27,7 +27,10 @@ class ModelConfig:
     attn_drop: float = 0.1
     proj_drop: float = 0.1
     drop_path: float = 0.0
-    rope_base: float = 10000.0
+
+    # Patch 注意力（OctFormer 风格）
+    patch_size: int = 1024         # patch 内 token 数（0 = 全注意力）
+    dilation: int = 4              # 膨胀率（跨 patch 连接）
 
     # 类别嵌入（仅 Level 0）
     num_classes: int = 1         # 1 = 无条件（虚拟类别 0）
