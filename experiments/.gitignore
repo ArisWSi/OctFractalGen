@@ -1,0 +1,8 @@
+logs/
+eval/
+runs/
+*.pt
+*.pth
+!extern/**/*.pth
+__pycache__/
+.ipynb_checkpoints/

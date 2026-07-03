@@ -1,0 +1,75 @@
+# OctFractalGen — Tiny model, Airplane category
+# First-pass experiment: validate the recursive multi-model pipeline.
+#
+# Usage:
+#   python -m src.train --config experiments/configs/fractal_tiny_airplane.yaml
+#   python -m src.evaluate --checkpoint logs/fractal_tiny_airplane/best.pt ...
+
+experiment:
+  name: fractal_tiny_airplane
+  description: "Tiny recursive AR octree model on ShapeNet airplane, VQ-VAE pipeline"
+
+model:
+  full_depth: 3
+  depth_stop: 5
+  fractal_levels: [3, 4]
+
+  # Per-level capacity (coarse → fine, decreasing)
+  embed_dims: [256, 128]
+  num_blocks: [8, 4]
+  num_heads: [4, 4]
+
+  # Shared transformer settings
+  mlp_ratio: 4.0
+  attn_drop: 0.1
+  proj_drop: 0.1
+  drop_path: 0.0
+  rope_base: 10000.0
+
+  # Condition (unconditional for first run)
+  num_classes: 1
+  label_drop_prob: 0.1
+
+  # Spatial conditioning (not yet wired — direction 4)
+  num_spatial_neighbors: 7
+  cond_embed_dim: 256
+
+  grad_checkpointing: false
+
+vqvae:
+  ckpt_path: "/root/autodl-tmp/OctGPT/vqvae_large_im5_uncond_bsq32.pth"
+  embedding_channels: 32
+  embedding_sizes: 128
+  quantizer_type: "bsq"
+  quantizer_group: 4
+  feature: "ND"
+  in_channels: 4
+  n_node_type: 7
+  vae_depth: 8
+
+data:
+  location: "/root/autodl-tmp/ShapeNet/processed"
+  filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
+  depth: 6
+  full_depth: 3
+  points_scale: 1.0
+  batch_size: 8
+  num_workers: 4
+  max_points: 120000
+  distort: false
+  # Validation
+  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
+
+train:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 3.0
+  max_epoch: 200
+  warmup_epochs: 20
+  use_amp: true
+  log_interval: 50
+  save_interval: 20
+  logdir: "logs/fractal_tiny_airplane"
+  device: "cuda"
+  seed: 42

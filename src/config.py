@@ -1,4 +1,4 @@
-"""Configuration for Occupancy-Only Recursive Octree Generation."""
+"""递归多模型八叉树生成（VQ-VAE 管线）的配置。"""
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -6,107 +6,125 @@ from typing import Optional, Tuple
 
 @dataclass
 class ModelConfig:
-    """Architecture hyperparameters for OctreeFractalGen."""
+    """OctreeFractalGen 的架构超参数。"""
 
-    # Octree structure
-    full_depth: int = 3  # initial octree depth (8 nodes at depth 3)
-    depth_stop: int = 5  # final generation depth
-    # fractal_levels: starting depth for each recursive level
-    # e.g. (3, 4) means level 0 handles depth 3→4, level 1 handles depth 4→5
+    # 八叉树结构
+    full_depth: int = 3          # 初始八叉树深度（深度 3 有 8 个节点）
+    depth_stop: int = 5          # 最终生成深度
+    # fractal_levels: 每递归层的起始深度
+    # 例如 (3, 4) 表示 level 0 处理深度 3→4, level 1 处理深度 4→5
     fractal_levels: Tuple[int, ...] = (3, 4)
 
-    # Per-level capacities (index 0 = coarsest, decreasing to finest)
+    # 每层容量（索引 0 = 最粗，向最细递减）
     embed_dims: Tuple[int, ...] = (512, 256)
     num_blocks: Tuple[int, ...] = (16, 8)
     num_heads: Tuple[int, ...] = (8, 4)
 
-    # Shared Transformer settings
+    # 共享 Transformer 设置
     mlp_ratio: float = 4.0
     attn_drop: float = 0.1
     proj_drop: float = 0.1
     drop_path: float = 0.0
     rope_base: float = 10000.0
 
-    # Class embedding (only Level 0)
-    num_classes: int = 1  # 1 = unconditional (dummy class 0)
-    label_drop_prob: float = 0.1  # for classifier-free guidance
+    # 类别嵌入（仅 Level 0）
+    num_classes: int = 1         # 1 = 无条件（虚拟类别 0）
+    label_drop_prob: float = 0.1  # CFG 的类别 dropout 概率
 
-    # Condition propagation
-    num_spatial_neighbors: int = 7  # center + 6 face neighbors
-    cond_embed_dim: int = 512  # dim of condition vectors passed between levels
+    # 条件传播
+    num_spatial_neighbors: int = 7   # 中心 + 6 个面邻居
+    cond_embed_dim: int = 512        # 层间传递的条件向量维度
 
-    # Gradient checkpointing
+    # 梯度检查点
     grad_checkpointing: bool = False
 
 
 @dataclass
+class VQVAEConfig:
+    """预训练 VQ-VAE 的配置。"""
+
+    # 预训练 VQ-VAE checkpoint 路径
+    ckpt_path: str = ""
+
+    # VQ 架构（必须与 checkpoint 匹配）
+    embedding_channels: int = 32     # 注意：OctGPT 默认用 32，非 64
+    embedding_sizes: int = 128
+    quantizer_type: str = "bsq"
+    quantizer_group: int = 4
+    feature: str = "ND"
+    in_channels: int = 4
+    n_node_type: int = 7
+    vae_depth: int = 8              # VQ-VAE 的最大八叉树深度
+
+
+@dataclass
 class DataConfig:
-    """ShapeNet data loading configuration."""
+    """ShapeNet 数据加载配置。"""
 
-    # Data paths
+    # 数据路径
     location: str = "data/ShapeNet/dataset_256"
-    filelist: str = "data/ShapeNet/airplane.txt"
+    filelist: str = "data/ShapeNet/filelist/train_airplane.txt"
+    val_filelist: str = ""            # 验证集文件列表（空则跳过验证）
 
-    # Octree construction
-    depth: int = 6  # max octree depth
-    full_depth: int = 3  # initial depth (matching ModelConfig)
-    points_scale: float = 1.0  # input points are in [-1, 1]
+    # 八叉树构建
+    depth: int = 6                  # 最大八叉树深度
+    full_depth: int = 3             # 初始深度（与 ModelConfig 匹配）
+    points_scale: float = 1.0       # 输入点云在 [-1, 1] 范围内
 
-    # Data loading
+    # 数据加载
     batch_size: int = 8
     num_workers: int = 4
     max_points: int = 120000
-    distort: bool = False  # disable noise for clean octree
+    distort: bool = False           # 禁用噪声以得到干净的八叉树
 
 
 @dataclass
 class TrainConfig:
-    """Training hyperparameters."""
+    """训练超参数，遵循 FractalGen 的配方。"""
 
-    # Optimization
+    # 优化器（FractalGen 的 AdamW 设置: wd=0.05, β=(0.9, 0.95)）
     lr: float = 1e-4
-    weight_decay: float = 0.01
+    weight_decay: float = 0.05
     betas: Tuple[float, float] = (0.9, 0.95)
-    grad_clip: float = 1.0
+    grad_clip: float = 3.0           # 遵循 FractalGen
 
-    # Schedule
+    # 学习率调度（FractalGen: 10% warmup + cosine）
     max_epoch: int = 200
-    warmup_epochs: int = 5
+    warmup_epochs: int = 20          # 200 epoch 的 10%
 
-    # Mixed precision
+    # 混合精度
     use_amp: bool = True
 
-    # Logging & checkpointing
-    log_interval: int = 50  # steps between logging
-    save_interval: int = 20  # epochs between checkpoints
+    # 日志与检查点
+    log_interval: int = 50           # 日志间隔（步数）
+    save_interval: int = 20          # checkpoint 间隔（epoch）
     logdir: str = "logs/"
 
-    # Hardware
+    # 硬件
     device: str = "cuda"
     seed: int = 42
 
 
 @dataclass
 class Config:
-    """Top-level configuration aggregator."""
+    """顶层配置聚合器。"""
 
     model: ModelConfig = field(default_factory=ModelConfig)
+    vqvae: VQVAEConfig = field(default_factory=VQVAEConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
 
-# Predefined model variants (following FractalGen naming convention)
+# ------------------------------------------------------------------
+# 预定义模型变体（遵循 FractalGen 命名约定）
+# ------------------------------------------------------------------
 
 def octree_fractal_tiny(**overrides) -> Config:
-    """Tiny model for fast iteration: 2 levels, small capacity."""
+    """微型模型，用于快速迭代: 2 层，小容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3,
-            depth_stop=5,
-            fractal_levels=(3, 4),
-            embed_dims=(256, 128),
-            num_blocks=(8, 4),
-            num_heads=(4, 4),
+            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
+            embed_dims=(256, 128), num_blocks=(8, 4), num_heads=(4, 4),
             cond_embed_dim=256,
             **overrides,
         )
@@ -114,15 +132,11 @@ def octree_fractal_tiny(**overrides) -> Config:
 
 
 def octree_fractal_base(**overrides) -> Config:
-    """Base model: 2 levels, moderate capacity."""
+    """基础模型: 2 层，中等容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3,
-            depth_stop=5,
-            fractal_levels=(3, 4),
-            embed_dims=(512, 256),
-            num_blocks=(16, 8),
-            num_heads=(8, 4),
+            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
+            embed_dims=(512, 256), num_blocks=(16, 8), num_heads=(8, 4),
             cond_embed_dim=512,
             **overrides,
         )
@@ -130,15 +144,11 @@ def octree_fractal_base(**overrides) -> Config:
 
 
 def octree_fractal_large(**overrides) -> Config:
-    """Large model: 2 levels, high capacity."""
+    """大型模型: 2 层，高容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3,
-            depth_stop=5,
-            fractal_levels=(3, 4),
-            embed_dims=(768, 384),
-            num_blocks=(24, 12),
-            num_heads=(12, 6),
+            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
+            embed_dims=(768, 384), num_blocks=(24, 12), num_heads=(12, 6),
             cond_embed_dim=768,
             **overrides,
         )

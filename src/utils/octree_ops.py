@@ -1,15 +1,16 @@
 """
-Octree operations for occupancy-only recursive generation.
+八叉树操作工具函数。
 
-Ports key utilities from OctGPT's utils/utils.py, adapted to minimize
-dependency on ocnn's internal APIs. We use ocnn only for the Octree
-data structure; tensor manipulation is done here.
+从 OctGPT 的 utils/utils.py 移植关键工具，尽量减少对 ocnn
+内部 API 的依赖。ocnn 仅用于 Octree 数据结构；
+张量操作均在此完成。
 
-Key functions:
-- octree2seq / seq2octree: convert octree children to flat binary sequence
-- get_node_xyz: extract (x, y, z) coordinates for nodes at a depth
-- morton_code: compute Morton (Z-order) code for spatial ordering
-- child_xyz: compute child node positions from parent
+关键函数:
+- octree2seq / seq2octree: 八叉树 children 与展平二值序列的互转
+- get_node_xyz: 提取指定深度的节点 (x, y, z) 坐标
+- morton_encode_3d: 计算 Morton (Z-order) 码用于空间排序
+- child_xyz: 从父节点坐标计算子节点位置
+- get_split_labels: 提取每父节点的 8-way 子节点占用标签
 """
 
 import copy
@@ -20,30 +21,30 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Morton (Z-order) encoding
+# Morton（Z-order）编码
 # ---------------------------------------------------------------------------
 
-def morton_encode_3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    """Compute Morton (Z-order) code for 3D coordinates.
+def morton_encode_3d(x: torch.Tensor, y: torch.Tensor,
+                     z: torch.Tensor) -> torch.Tensor:
+    """为 3D 坐标计算 Morton (Z-order) 码。
 
-    Interleaves bits from x, y, z to produce a 1D ordering that preserves
-    spatial locality. Uses the classic bit-interleaving approach.
+    交错 x、y、z 的二进制位，产生保持空间局部性的 1D 排序。
+    使用经典的位交错方法。
 
-    Args:
-        x, y, z: integer tensors of the same shape, values in [0, 2^depth)
+    参数:
+        x, y, z: 同形状的整数张量，值在 [0, 2^depth) 范围内
 
-    Returns:
-        Morton codes as int64 tensor
+    返回:
+        Morton 码，int64 张量
     """
     def spread_bits(v):
-        """Spread bits of v apart by factor of 3."""
+        """将 v 的二进制位按因子 3 扩散。"""
         v = (v | (v << 16)) & 0x030000FF
         v = (v | (v << 8)) & 0x0300F00F
         v = (v | (v << 4)) & 0x030C30C3
         v = (v | (v << 2)) & 0x09249249
         return v
 
-    # Ensure inputs are int64 for bit operations
     x = x.long()
     y = y.long()
     z = z.long()
@@ -52,69 +53,70 @@ def morton_encode_3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch
 
 
 def morton_order_indices(xyz: torch.Tensor) -> torch.Tensor:
-    """Return indices that sort coordinates by Morton order.
+    """返回按 Morton 序排序的索引。
 
-    Args:
-        xyz: (N, 3) integer coordinates
+    参数:
+        xyz: (N, 3) 整数坐标
 
-    Returns:
-        indices: (N,) tensor of sorted indices
+    返回:
+        indices: (N,) 排序后的索引张量
     """
     codes = morton_encode_3d(xyz[:, 0], xyz[:, 1], xyz[:, 2])
     return torch.argsort(codes)
 
 
 # ---------------------------------------------------------------------------
-# Child coordinate computation
+# 子节点坐标计算
 # ---------------------------------------------------------------------------
 
 def child_xyz(parent_xyz: torch.Tensor) -> torch.Tensor:
-    """Compute coordinates of 8 children for each parent node.
+    """计算每个父节点的 8 个子节点坐标。
 
-    In an octree, each node at depth d has 8 potential children at depth d+1.
-    Children are indexed 0-7, where bit 0 = +x, bit 1 = +y, bit 2 = +z.
+    八叉树中，深度 d 的每个节点在深度 d+1 有 8 个潜在子节点。
+    子节点索引 0-7，其中 bit 0 = +x, bit 1 = +y, bit 2 = +z。
 
-    Child mapping (cx, cy, cz) where cx = (index >> 0) & 1, etc.:
+    子节点映射（cx, cy, cz），其中 cx = (index >> 0) & 1 等:
         0: (0,0,0)  1: (1,0,0)  2: (0,1,0)  3: (1,1,0)
         4: (0,0,1)  5: (1,0,1)  6: (0,1,1)  7: (1,1,1)
 
-    Args:
-        parent_xyz: (*, 3) parent coordinates at depth d
+    参数:
+        parent_xyz: (*, 3) 深度 d 的父节点坐标
 
-    Returns:
-        children_xyz: (*, 8, 3) child coordinates at depth d+1
+    返回:
+        children_xyz: (*, 8, 3) 深度 d+1 的子节点坐标
     """
     *batch_dims, _ = parent_xyz.shape
     device = parent_xyz.device
 
-    # Child offsets for 8 octants: (8, 3)
+    # 8 个八分圆的子节点偏移: (8, 3)
     offsets = torch.tensor([
         [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
         [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
     ], device=device, dtype=parent_xyz.dtype)
 
-    # Parent coords doubled (since each unit at depth d = 2 units at depth d+1)
+    # 父节点坐标加倍（深度 d 的每单位 = 深度 d+1 的 2 单位）
     parent_doubled = (parent_xyz * 2).unsqueeze(-2)  # (*, 1, 3)
-    children = parent_doubled + offsets.view(*([1] * len(batch_dims)), 8, 3)
+    children = parent_doubled + offsets.view(
+        *([1] * len(batch_dims)), 8, 3)
     return children
 
 
 # ---------------------------------------------------------------------------
-# Node coordinate extraction
+# 节点坐标提取
 # ---------------------------------------------------------------------------
 
-def get_node_xyz(octree, depth: int) -> torch.Tensor:
-    """Get (x, y, z) integer coordinates of all nodes at a given depth.
+def get_node_xyz(octree, depth: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """获取指定深度的所有节点的 (x, y, z) 整数坐标。
 
-    Uses ocnn's octree.xyzb() which returns (x, y, z, batch_idx).
+    使用 ocnn 的 octree.xyzb()，返回 (x, y, z, batch_idx)。
 
-    Args:
-        octree: ocnn.Octree object
-        depth: depth level to query
+    参数:
+        octree: ocnn.Octree 对象
+        depth: 查询的深度层级
 
-    Returns:
-        xyz: (nnum, 3) tensor of integer coordinates in [0, 2^depth)
-        batch_idx: (nnum,) tensor of batch indices
+    返回:
+        xyz: (nnum, 3) 整数坐标张量，值在 [0, 2^depth) 范围内
+        batch_idx: (nnum,) batch 索引张量
     """
     x, y, z, b = octree.xyzb(depth, nempty=False)
     xyz = torch.stack([x, y, z], dim=1).long()
@@ -122,24 +124,24 @@ def get_node_xyz(octree, depth: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# octree2seq / seq2octree (ported from OctGPT utils/utils.py)
+# octree2seq / seq2octree（从 OctGPT utils/utils.py 移植）
 # ---------------------------------------------------------------------------
 
 def octree2seq(octree, depth_low: int, depth_high: int,
                shift: bool = False) -> torch.Tensor:
-    """Extract ground-truth split labels from octree as a flat sequence.
+    """从八叉树提取 ground-truth split 标签，展平为一维序列。
 
-    Each node at depth d has children[d] which records the index of its
-    first child (or -1 if it has none). child[i] >= 0 means child i exists.
+    深度 d 的每个节点有 children[d]，记录其第一个子节点的索引
+    （无子节点则为 -1）。child[i] >= 0 表示子节点存在。
 
-    Args:
-        octree: ocnn.Octree object
-        depth_low: start depth (inclusive)
-        depth_high: end depth (inclusive)
-        shift: if True, scale labels from {0,1} to {-1,1}
+    参数:
+        octree: ocnn.Octree 对象
+        depth_low: 起始深度（含）
+        depth_high: 结束深度（不含）
+        shift: 若为 True，将标签从 {0,1} 缩放到 {-1,1}
 
-    Returns:
-        seq: (total_nnum,) long tensor of binary split labels
+    返回:
+        seq: (total_nnum,) long 张量，二值 split 标签
     """
     seq = torch.cat([octree.children[d] for d in range(depth_low, depth_high)])
     seq = (seq >= 0).long()
@@ -151,24 +153,24 @@ def octree2seq(octree, depth_low: int, depth_high: int,
 
 def seq2octree(octree, seq: torch.Tensor, depth_low: int, depth_high: int,
                threshold: float = 0.0):
-    """Reconstruct octree from predicted split sequence.
+    """从预测的 split 序列重建八叉树。
 
-    The sequence `seq` contains per-node binary split labels across all
-    depths in [depth_low, depth_high). Each value indicates whether the
-    corresponding node should be split (i.e., has children).
+    序列 `seq` 包含 [depth_low, depth_high) 范围内所有深度
+    的逐节点二值 split 标签。每个值指示对应节点是否应分裂
+    （即有子节点）。
 
-    octree_split(label, depth) with label=1 creates all 8 children;
-    label=0 makes the node a leaf.
+    octree_split(label, depth) 中 label=1 创建全部 8 个子节点；
+    label=0 使该节点成为叶子。
 
-    Args:
-        octree: starting ocnn.Octree (modified in-place)
-        seq: (total_nnum,) float tensor of split logits/probabilities
-        depth_low: start depth (inclusive)
-        depth_high: end depth (exclusive)
-        threshold: values > threshold → split
+    参数:
+        octree: 起始 ocnn.Octree（浅拷贝，原地修改）
+        seq: (total_nnum,) float 张量，split logits/概率
+        depth_low: 起始深度（含）
+        depth_high: 结束深度（不含）
+        threshold: 值 > threshold → 分裂
 
-    Returns:
-        octree_out: new octree with structure up to depth_high
+    返回:
+        octree_out: 新八叉树，结构到 depth_high
     """
     discrete_seq = (seq > threshold).long()
 
@@ -186,22 +188,22 @@ def seq2octree(octree, seq: torch.Tensor, depth_low: int, depth_high: int,
 
 
 # ---------------------------------------------------------------------------
-# Per-depth split extraction (for recursive model targets)
+# 逐深度 split 标签提取（用于递归模型的 target）
 # ---------------------------------------------------------------------------
 
 def get_split_labels(octree, depth: int) -> torch.Tensor:
-    """Get per-parent 8-way split labels at a single depth.
+    """获取单深度的逐父节点 8-way split 标签。
 
-    Maps each child node at depth d+1 to its parent at depth d and
-    determines which of the 8 octants it occupies.
+    将深度 d+1 的每个子节点映射到深度 d 的父节点，
+    并确定其占据的八分圆。
 
-    Args:
+    参数:
         octree: ocnn.Octree
-        depth: parent depth d
+        depth: 父节点深度 d
 
-    Returns:
-        labels: (nnum_d, 8) float32 tensor, labels[p, c] = 1.0
-                if octant c of parent p exists at depth d+1
+    返回:
+        labels: (nnum_d, 8) float32 张量，labels[p, c] = 1.0
+                表示父节点 p 的八分圆 c 在深度 d+1 处存在
     """
     nnum_d = octree.nnum[depth]
     device = octree.device
@@ -214,11 +216,11 @@ def get_split_labels(octree, depth: int) -> torch.Tensor:
     if nnum_next == 0:
         return labels
 
-    # Get coordinates at both depths
+    # 获取两个深度的坐标
     cx, cy, cz, cb = octree.xyzb(depth + 1, nempty=False)
     px, py, pz, pb = octree.xyzb(depth, nempty=False)
 
-    # Parent coordinate = child coordinate // 2
+    # 父坐标 = 子坐标 // 2
     child_parent_x = cx // 2
     child_parent_y = cy // 2
     child_parent_z = cz // 2
@@ -227,13 +229,13 @@ def get_split_labels(octree, depth: int) -> torch.Tensor:
     oct_z = cz % 2
     octant = oct_x + 2 * oct_y + 4 * oct_z  # 0-7
 
-    # Build parent lookup: (batch, x, y, z) → parent_index
+    # 构建父节点查找表: (batch, x, y, z) → parent_index
     parent_lookup = {}
     for p in range(nnum_d):
         key = (int(pb[p]), int(px[p]), int(py[p]), int(pz[p]))
         parent_lookup[key] = p
 
-    # Match children to parents
+    # 匹配子节点到父节点
     for c in range(nnum_next):
         pkey = (int(cb[c]), int(child_parent_x[c]),
                 int(child_parent_y[c]), int(child_parent_z[c]))
@@ -245,36 +247,21 @@ def get_split_labels(octree, depth: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Helper: node ordering
+# 辅助函数: 节点排序
 # ---------------------------------------------------------------------------
 
-def get_morton_ordered_nodes(octree, depth: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Get nodes at a depth sorted by Morton (Z-order) code.
+def get_morton_ordered_nodes(octree, depth: int
+                             ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """获取按 Morton (Z-order) 码排序的节点。
 
-    Args:
+    参数:
         octree: ocnn.Octree
-        depth: depth to query
+        depth: 查询的深度
 
-    Returns:
-        xyz_sorted: (nnum, 3) coordinates in Morton order
-        sort_idx: (nnum,) indices for reordering to Morton order
+    返回:
+        xyz_sorted: (nnum, 3) Morton 序排列的坐标
+        sort_idx: (nnum,) 重排到 Morton 序的索引
     """
     xyz, batch = get_node_xyz(octree, depth)
     sort_idx = morton_order_indices(xyz)
     return xyz[sort_idx], sort_idx
-
-
-def get_parent_children_xyz(octree, depth: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Get parent xyz and all child xyz at consecutive depths.
-
-    Args:
-        octree: ocnn.Octree
-        depth: parent depth
-
-    Returns:
-        parent_xyz: (nnum_d, 3) parent coordinates at depth
-        all_children_xyz: (nnum_d, 8, 3) coordinates of all 8 children per parent
-    """
-    xyz, _ = get_node_xyz(octree, depth)
-    all_children = child_xyz(xyz)  # (nnum_d, 8, 3)
-    return xyz, all_children

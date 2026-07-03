@@ -1,0 +1,56 @@
+# OctGPT Baseline — Airplane, unconditional
+# Reference config matching OctGPT's shapenet_uncond.yaml for fair comparison.
+#
+# This is NOT used for training OctGPT (use its own main_octgpt.py);
+# it serves as a documented reference of the baseline configuration
+# that OctFractalGen is compared against.
+
+# OctGPT paper baseline (from extern/octgpt/configs/ShapeNet/shapenet_uncond.yaml)
+
+baseline:
+  model: OctGPT
+  total_params: "~150M (estimated: OctFormer 768dim, 24 blocks, 8 heads)"
+
+  octree:
+    depth: 8
+    full_depth: 3
+    depth_stop: 6
+
+  octformer:
+    num_embed: 768
+    num_heads: 8
+    num_blocks: 24
+    patch_size: 2048
+    dilation: 2
+    buffer_size: 64
+    drop_rate: 0.1
+    use_checkpoint: true
+    use_swin: true
+    pos_emb_type: SinPosEmb
+
+  training:
+    max_epoch: 400
+    lr: 1.0e-4
+    weight_decay: 0.01
+    batch_size: 1  # ocnn internal batching
+    use_amp: true
+    mask_ratio_min: 0.5
+    num_iters: [64, 128, 128, 256]  # per depth
+
+  vqvae:
+    model: vqvae_large
+    embedding_channels: 32
+    quantizer_type: bsq
+    ckpt: saved_ckpt/vqvae_huge_im5_bsq32_200epoch.pth
+
+  data:
+    location: "data/ShapeNet/dataset_256"
+    filelist_train: "data/ShapeNet/filelist/train_airplane.txt"
+    filelist_test: "data/ShapeNet/filelist/test_airplane.txt"
+    samples: 2831
+
+  metrics:
+    1-NNA-CD-acc: "TBD (target: ~50%)"
+    COV-CD: "TBD"
+    MMD-CD: "TBD"
+    generation_speed: "TBD (seconds per shape)"

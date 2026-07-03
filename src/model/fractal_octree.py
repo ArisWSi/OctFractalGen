@@ -1,19 +1,15 @@
 """
-OctreeFractalGen: Recursive Multi-Model Octree Generator.
+OctreeFractalGen: 递归多模型八叉树生成器。
 
-Adapts FractalGen's recursive architecture for 3D octrees.
-Each level handles one octree depth transition independently
-(reads parent nodes from ground-truth octree at training time).
-The recursive structure provides:
-  - Hierarchical model capacity (coarse → fine decreasing params)
-  - Independent autoregressive generation per level
-  - Direct occupancy output (no VQ-VAE)
+从 FractalGen 的递归架构适配到 3D 八叉树。每层独立处理
+一个深度转换。递归结构提供:
+  - 层级化模型容量（粗→细递减参数量）
+  - 每层独立的自回归生成
+  - 最终层通过 VQ-VAE 解码几何
 
-Phase 1 design (Direction 5):
-  - 2 recursive levels: full_depth→full_depth+1, full_depth+1→full_depth+2
-  - Each level: AR Transformer → child occupancy prediction (BCE loss)
-  - Final level: GeoHead MLP → occupancy at finest depth
-  - Global condition: class embedding repeated per node
+架构（2层，full_depth=3, depth_stop=5）:
+  Level 0（深度 3→4）: OctreeAR Transformer → split 预测
+  Level 1（深度 4→5）: VQHead → BSQ 编码预测 → VQ-VAE 解码
 """
 
 from typing import Optional, Tuple
@@ -26,28 +22,38 @@ from src.utils.octree_ops import get_node_xyz, get_split_labels
 
 
 # ---------------------------------------------------------------------------
-# GeoHead: lightweight final-level occupancy predictor
+# VQHead: 最终层 BSQ 编码预测器
 # ---------------------------------------------------------------------------
 
-class GeoHead(nn.Module):
-    """Predict binary occupancy at the finest octree depth.
+class VQHead(nn.Module):
+    """在最终深度预测 BSQ（二值球面量化）编码。
 
-    Lightweight MLP: position + condition → occupancy logit.
-    No VQ-VAE, no codebook — direct BCE on occupancy.
+    每个 depth_stop 处的叶子节点需要一个 VQ 编码来描述其局部几何。
+    对于 BSQ（D 组），编码是 D 个独立的二值 → D × 2 类交叉熵损失。
+
+    参数:
+        embed_dim: 内部特征维度
+        cond_dim_in: 条件输入维度
+        vq_groups: BSQ 量化组数（从 VQVAEWrapper 获取）
     """
 
-    def __init__(self, embed_dim: int = 128, cond_dim_in: int = 512):
+    def __init__(self, embed_dim: int = 128, cond_dim_in: int = 512,
+                 vq_groups: int = 64):
         super().__init__()
+        self.vq_groups = vq_groups
+        self.vq_size = 2  # BSQ: 每组二值化
+
         self.cond_proj = nn.Linear(cond_dim_in, embed_dim, bias=True)
         self.pos_emb = nn.Linear(3, embed_dim, bias=True)
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm = nn.LayerNorm(embed_dim, eps=1e-5)
 
+        # 轻量 MLP: 位置 + 条件 → 每组的 VQ logits
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim // 2, 1),
+            nn.Linear(embed_dim, self.vq_groups * self.vq_size),
         )
         self.initialize_weights()
 
@@ -68,41 +74,43 @@ class GeoHead(nn.Module):
 
     def forward(
         self,
-        parent_xyz: torch.Tensor,        # (B, Np, 3)
-        parent_cond: torch.Tensor,       # (B, Np, cond_dim_in)
-        child_gt_mask: Optional[torch.Tensor] = None,  # (B, Np, 8)
+        parent_xyz: torch.Tensor,
+        parent_cond: torch.Tensor,
+        vq_targets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict occupancy for 8 children per parent.
+        """为叶子节点预测 VQ 编码。
 
-        Returns:
-            logits: (B, Np, 8)
-            loss: scalar BCE loss
+        参数:
+            parent_xyz: (B, Np, 3) depth_stop-1 处的叶子节点坐标
+            parent_cond: (B, Np, cond_dim_in) 每节点条件
+            vq_targets: (nnum, vq_groups) ground-truth BSQ indices (每组 0/1)
+
+        返回:
+            logits: (B*Np, vq_groups, 2) VQ 分类 logits
+            loss: 标量交叉熵损失
         """
         B, Np, _ = parent_xyz.shape
         device = parent_xyz.device
+        total_nodes = B * Np
 
-        # 8 child positions per parent
-        offsets = torch.tensor([
-            [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
-            [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
-        ], device=device, dtype=torch.float32)
-
-        children_xyz = (parent_xyz.float() * 2).unsqueeze(2) + offsets.view(1, 1, 8, 3)
-        # (B, Np, 8, 3)
-
-        pos_emb = self.pos_emb(children_xyz)                    # (B, Np, 8, embed_dim)
-        cond_emb = self.cond_proj(parent_cond).unsqueeze(2)      # (B, Np, 1, embed_dim)
-        h = self.norm(pos_emb + cond_emb)                        # (B, Np, 8, embed_dim)
-        logits = self.mlp(h).squeeze(-1)                         # (B, Np, 8)
+        pos_emb = self.pos_emb(parent_xyz.float())        # (B, Np, embed_dim)
+        cond_emb = self.cond_proj(parent_cond)              # (B, Np, embed_dim)
+        h = self.norm(pos_emb + cond_emb)                   # (B, Np, embed_dim)
+        logits = self.mlp(h)                                # (B, Np, vq_groups*2)
+        logits = logits.view(B, Np, self.vq_groups, self.vq_size)
+        logits_flat = logits.reshape(total_nodes, self.vq_groups, self.vq_size)
 
         loss = torch.tensor(0.0, device=device)
-        if child_gt_mask is not None:
-            loss = nn.functional.binary_cross_entropy_with_logits(
-                logits.reshape(-1), child_gt_mask.float().reshape(-1),
+        if vq_targets is not None:
+            targets_flat = vq_targets.reshape(-1, self.vq_groups).long()
+            # 每组独立的 2 类交叉熵
+            loss = nn.functional.cross_entropy(
+                logits_flat.reshape(-1, self.vq_size),
+                targets_flat.reshape(-1),
                 reduction='mean',
             )
 
-        return logits, loss
+        return logits_flat, loss
 
     @torch.no_grad()
     def sample(
@@ -110,61 +118,69 @@ class GeoHead(nn.Module):
         parent_xyz: torch.Tensor,
         parent_cond: torch.Tensor,
         temperature: float = 1.0,
-        threshold: float = 0.5,
     ) -> torch.Tensor:
-        """Sample occupancy at final depth.
+        """在最终深度采样 VQ indices。
 
-        Returns:
-            mask: (B, Np, 8) binary occupancy
+        返回:
+            indices: (nnum, vq_groups) 预测的 BSQ indices {0, 1}
         """
         logits, _ = self.forward(parent_xyz, parent_cond)
-        probs = torch.sigmoid(logits / temperature)
-        return (probs > threshold).float()
+
+        # 温度缩放
+        logits = logits / temperature
+
+        # 按组采样（2 类 categorical）
+        probs = torch.softmax(logits, dim=-1)              # (nnum, vq_groups, 2)
+        indices = torch.multinomial(
+            probs.reshape(-1, self.vq_size), num_samples=1
+        ).squeeze(-1)                                      # (nnum * vq_groups,)
+        indices = indices.reshape(-1, self.vq_groups)      # (nnum, vq_groups)
+
+        return indices
 
 
 # ---------------------------------------------------------------------------
-# OctreeFractalGen: recursive multi-model container
+# OctreeFractalGen: 递归多模型容器
 # ---------------------------------------------------------------------------
 
 class OctreeFractalGen(nn.Module):
-    """Recursive multi-model octree generator.
+    """递归多模型八叉树生成器，配合 VQ-VAE 解码。
 
-    Architecture (2-level example, full_depth=3, depth_stop=5):
-        Level 0 (depth 3→4):
-            OctreeAR: 512-dim, 16 blocks, 8 heads
-            Predicts which of ≤64 children (8 parents × 8) exist
+    中间层使用 OctreeAR 预测八叉树结构（split）。
+    最终层使用 VQHead 预测 BSQ 几何编码，由冻结的预训练
+    VQ-VAE 解码为 mesh。
 
-        Level 1 / GeoHead (depth 4→5):
-            GeoHead: 128-dim MLP
-            Predicts occupancy of ≤512 children (≤64 parents × 8)
-
-    Each level receives the same global class-condition repeated per node.
-    Cross-level conditioning (spatial neighbors, per-node features) is
-    deferred to Direction 4.
+    参数:
+        config: ModelConfig
+        vqvae_wrapper: VQVAEWrapper（冻结的 VQ-VAE，用于编码/解码）
+        fractal_level: 内部递归计数器（顶层为 0）
     """
 
-    def __init__(self, config, fractal_level: int = 0):
+    def __init__(self, config, vqvae_wrapper=None, fractal_level: int = 0):
         super().__init__()
         self.config = config
         self.fractal_level = fractal_level
         self.num_levels = len(config.fractal_levels)
         self.current_depth = config.fractal_levels[fractal_level]
+        self.vqvae_wrapper = vqvae_wrapper
 
         # ------------------------------------------------------------------
-        # Class embedding (top level only)
+        # 类别嵌入（仅顶层）
         # ------------------------------------------------------------------
         if fractal_level == 0:
             self.num_classes = config.num_classes
-            # +1 slot for CFG "fake" class
-            self.class_emb = nn.Embedding(config.num_classes + 1,
-                                          config.cond_embed_dim)
+            # 遵循 FractalGen: embedding 大小 = num_classes（不含额外槽位，
+            # CFG 的假类别通过单独的 fake_latent 参数处理）
+            self.class_emb = nn.Embedding(
+                config.num_classes, config.cond_embed_dim,
+            )
             self.label_drop_prob = config.label_drop_prob
             self.fake_latent = nn.Parameter(torch.zeros(1, config.cond_embed_dim))
             nn.init.normal_(self.class_emb.weight, std=0.02)
             nn.init.normal_(self.fake_latent, std=0.02)
 
         # ------------------------------------------------------------------
-        # Current level generator
+        # 当前层生成器
         # ------------------------------------------------------------------
         is_final = (fractal_level == self.num_levels - 1)
 
@@ -181,35 +197,34 @@ class OctreeFractalGen(nn.Module):
             )
 
         # ------------------------------------------------------------------
-        # Next level (recursive or terminal)
+        # 下一层（递归或终止 VQHead）
         # ------------------------------------------------------------------
         if not is_final:
-            self.next_fractal = OctreeFractalGen(config, fractal_level + 1)
+            self.next_fractal = OctreeFractalGen(
+                config, vqvae_wrapper, fractal_level + 1,
+            )
         else:
-            self.next_fractal = GeoHead(
+            # 从 VQ-VAE wrapper 获取 vq_groups（而非硬编码）
+            vq_groups = 64
+            if vqvae_wrapper is not None:
+                vq_groups = vqvae_wrapper.get_vq_config()['vq_groups']
+            self.next_fractal = VQHead(
                 embed_dim=config.embed_dims[-1],
                 cond_dim_in=config.cond_embed_dim,
+                vq_groups=vq_groups,
             )
 
     # ------------------------------------------------------------------
-    # Condition helper
+    # 条件辅助函数
     # ------------------------------------------------------------------
 
-    def _get_class_condition(self, octree, labels: Optional[torch.Tensor] = None
-                             ) -> torch.Tensor:
-        """Get per-node class condition for the top-level nodes.
-
-        Returns:
-            cond: (B, Np, cond_embed_dim)
-        """
+    def _get_class_condition(self, octree, labels=None) -> torch.Tensor:
+        """获取类别条件嵌入，训练时随机 dropout（CFG 训练）。"""
         B = octree.batch_size
         device = octree.device
-
         if labels is None:
             labels = torch.zeros(B, dtype=torch.long, device=device)
-
-        class_embedding = self.class_emb(labels)  # (B, cond_dim)
-
+        class_embedding = self.class_emb(labels)
         if self.training:
             drop_mask = (
                 torch.rand(B, device=device) < self.label_drop_prob
@@ -217,168 +232,131 @@ class OctreeFractalGen(nn.Module):
             class_embedding = (
                 drop_mask * self.fake_latent + (1 - drop_mask) * class_embedding
             )
+        return class_embedding
 
-        return class_embedding  # (B, cond_dim)
-
-    def _make_per_node_cond(self, global_cond: torch.Tensor, nnum: int, B: int
-                            ) -> torch.Tensor:
-        """Expand global condition to per-node.
-
-        Args:
-            global_cond: (B, cond_dim)
-            nnum: total number of nodes at this depth
-            B: batch size
-
-        Returns:
-            per_node_cond: (B, nnum//B, cond_dim)
-        """
+    def _make_per_node_cond(self, global_cond, nnum, B):
+        """将全局条件扩展到每节点。"""
         Np = nnum // B
         return global_cond.unsqueeze(1).expand(B, Np, -1)
 
     # ------------------------------------------------------------------
-    # Forward pass
+    # 训练前向传播
     # ------------------------------------------------------------------
 
-    def forward(self, octree, labels: Optional[torch.Tensor] = None
-                ) -> torch.Tensor:
-        """Top-level entry: compute class condition and recurse.
+    def forward(self, octree, labels=None) -> torch.Tensor:
+        """顶层入口：计算类别条件并递归。
 
-        Args:
-            octree: ocnn.Octree (ground truth for training)
-            labels: (B,) class labels (None → unconditional)
+        参数:
+            octree: ocnn.Octree（ground truth）
+            labels: (B,) 类别标签（None → 无条件）
 
-        Returns:
-            total_loss: sum of BCE losses from all levels
+        返回:
+            total_loss: 所有层级的损失之和
         """
         if self.fractal_level != 0:
-            raise RuntimeError(
-                "Forward should only be called on the top-level OctreeFractalGen"
-            )
-
+            raise RuntimeError("forward() 仅可在顶层模型上调用")
         B = octree.batch_size
-        device = octree.device
+        class_cond = self._get_class_condition(octree, labels)
+        return self._forward_level(octree, class_cond)
 
-        # Global class condition
-        class_cond = self._get_class_condition(octree, labels)  # (B, cond_dim)
+    def _forward_level(self, octree, global_cond) -> torch.Tensor:
+        """通过一个递归层级做前向传播。
 
-        # Recurse through all levels
-        total_loss = self._forward_level(octree, class_cond)
-        return total_loss
-
-    def _forward_level(self, octree, global_cond: torch.Tensor) -> torch.Tensor:
-        """Forward through one recursive level.
-
-        Each level:
-        1. Reads parent nodes at its depth from octree
-        2. Expands global condition to per-node
-        3. Predicts child occupancy via its generator
-        4. Computes BCE loss against ground truth
-        5. Recurses to next level
-
-        Args:
-            octree: ocnn.Octree (ground truth)
-            global_cond: (B, cond_dim) class condition
-
-        Returns:
-            scalar loss
+        中间层: AR split 预测（8-way 占用率的 BCE）。
+        最终层: VQ 编码预测（BSQ indices 的交叉熵）。
         """
         depth = self.config.fractal_levels[self.fractal_level]
         B = octree.batch_size
         device = octree.device
 
-        # Get parent nodes at this depth
-        parent_xyz, _ = get_node_xyz(octree, depth)     # (total_nnum, 3)
+        parent_xyz, _ = get_node_xyz(octree, depth)
         nnum = octree.nnum[depth]
-
         if nnum == 0:
-            # No nodes at this depth (empty octree) → skip
             return torch.tensor(0.0, device=device)
 
         Np = nnum // B
-        parent_xyz_3d = parent_xyz.view(B, Np, 3)        # (B, Np, 3)
-        parent_cond = self._make_per_node_cond(global_cond, nnum, B)  # (B, Np, cond_dim)
+        parent_xyz_3d = parent_xyz.view(B, Np, 3)
+        parent_cond = self._make_per_node_cond(global_cond, nnum, B)
 
-        # Ground truth child labels
-        gt_labels = get_split_labels(octree, depth)       # (nnum, 8)
-        gt_labels = gt_labels.view(B, Np, 8)              # (B, Np, 8)
+        is_final = (self.fractal_level == self.num_levels - 1)
 
-        # Forward through current level's generator
-        if self.fractal_level < self.num_levels - 1:
-            # AR Transformer level
-            _, _, level_loss = self.generator(parent_xyz_3d, parent_cond, gt_labels)
+        if not is_final:
+            # --- 中间 AR 层: split 预测 ---
+            gt_labels = get_split_labels(octree, depth).view(B, Np, 8)
+            _, _, level_loss = self.generator(
+                parent_xyz_3d, parent_cond, gt_labels)
+
+            deeper_loss = torch.tensor(0.0, device=device)
+            if isinstance(self.next_fractal, OctreeFractalGen):
+                deeper_loss = self.next_fractal._forward_level(
+                    octree, global_cond)
+            return level_loss + deeper_loss
+
         else:
-            # GeoHead (final level)
-            _, level_loss = self.next_fractal(parent_xyz_3d, parent_cond, gt_labels)
+            # --- 最终 VQHead 层: VQ 编码预测 ---
+            if self.vqvae_wrapper is None:
+                raise RuntimeError(
+                    "最终层训练需要 vqvae_wrapper")
 
-        # Recurse to next level with same global condition
-        deeper_loss = torch.tensor(0.0, device=device)
-        if isinstance(self.next_fractal, OctreeFractalGen):
-            deeper_loss = self.next_fractal._forward_level(octree, global_cond)
-        # Note: if self.next_fractal is GeoHead, it was already computed above
-        # (when self.fractal_level == self.num_levels - 1)
+            # 从八叉树提取 ground-truth VQ targets
+            vq_targets = self.vqvae_wrapper.extract_targets(octree)
+            # vq_targets: (nnum_at_depth_stop, vq_groups)
 
-        return level_loss + deeper_loss
+            # 获取最终深度的叶子节点坐标
+            final_depth = self.config.depth_stop
+            leaf_xyz, _ = get_node_xyz(octree, final_depth)
+            nnum_leaf = octree.nnum[final_depth]
+            if nnum_leaf == 0:
+                return torch.tensor(0.0, device=device)
+
+            Np_final = nnum_leaf // B
+            leaf_xyz_3d = leaf_xyz.view(B, Np_final, 3)
+
+            # 为叶子节点构建每节点条件
+            leaf_cond = self._make_per_node_cond(global_cond, nnum_leaf, B)
+
+            # VQHead 前向
+            _, level_loss = self.next_fractal(
+                leaf_xyz_3d, leaf_cond, vq_targets)
+
+            return level_loss
 
     # ------------------------------------------------------------------
-    # Generation (inference)
+    # 生成（推理）
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def generate(
-        self,
-        octree,
-        labels: Optional[torch.Tensor] = None,
-        temperature: float = 1.0,
-        cfg_scale: float = 1.0,
-    ):
-        """Recursively generate the octree from scratch.
+    def generate(self, octree, labels=None, temperature=1.0, cfg_scale=1.0):
+        """递归生成八叉树结构 + VQ 编码。
 
-        Args:
-            octree: ocnn.Octree initialized at full_depth (via init_octree)
-            labels: (B,) class labels
-            temperature: sampling temperature
-            cfg_scale: CFG scale (1.0 = no guidance)
-
-        Returns:
-            octree: generated octree with structure up to depth_stop
+        返回:
+            octree: 生成到 depth_stop 的八叉树
+            vq_indices: (nnum_leaf, vq_groups) 预测的 BSQ indices
         """
         if self.fractal_level != 0:
-            raise RuntimeError("generate() should only be called on top level")
+            raise RuntimeError("generate() 仅可在顶层模型上调用")
 
         B = octree.batch_size
         device = octree.device
-
         if labels is None:
             labels = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Class condition
-        class_cond = self.class_emb(labels)  # (B, cond_dim)
+        class_cond = self.class_emb(labels)
+        uncond = self.fake_latent.expand(B, -1) if cfg_scale != 1.0 else None
 
-        # CFG unconditional branch
-        uncond = None
-        if cfg_scale != 1.0:
-            uncond = self.fake_latent.expand(B, -1)  # (B, cond_dim)
-
-        return self._generate_level(octree, class_cond, temperature, cfg_scale, uncond)
+        return self._generate_level(
+            octree, class_cond, temperature, cfg_scale, uncond)
 
     @torch.no_grad()
-    def _generate_level(
-        self,
-        octree,
-        global_cond: torch.Tensor,
-        temperature: float,
-        cfg_scale: float,
-        uncond: Optional[torch.Tensor] = None,
-    ):
-        """Generate one octree depth and recurse."""
+    def _generate_level(self, octree, global_cond, temperature,
+                        cfg_scale, uncond=None):
+        """生成一个八叉树深度并递归。"""
         depth = self.config.fractal_levels[self.fractal_level]
         B = octree.batch_size
         device = octree.device
 
-        # Get parent nodes at current depth
         parent_xyz, _ = get_node_xyz(octree, depth)
         nnum = octree.nnum[depth]
-
         if nnum == 0:
             return octree, None
 
@@ -386,71 +364,69 @@ class OctreeFractalGen(nn.Module):
         parent_xyz_3d = parent_xyz.view(B, Np, 3)
         parent_cond = self._make_per_node_cond(global_cond, nnum, B)
 
-        # CFG: blend conditional and unconditional logits
-        if cfg_scale != 1.0 and uncond is not None:
-            parent_cond_uncond = self._make_per_node_cond(uncond, nnum, B)
-        else:
-            parent_cond_uncond = None
+        is_final = (self.fractal_level == self.num_levels - 1)
 
-        if self.fractal_level < self.num_levels - 1:
-            # AR Transformer level: autoregressive sample (8-way per parent)
+        if not is_final:
+            # --- 中间层: 采样 split, 展开八叉树 ---
             child_8way, _ = self.generator.sample(
-                parent_xyz_3d, parent_cond, temperature
-            )  # (B, Np, 8) binary
-
-            # Collapse 8-way → per-node binary: split if ANY child exists
-            split_label = child_8way.any(dim=-1).long()  # (B, Np)
-            split_label = split_label.reshape(B * Np)     # (nnum,)
+                parent_xyz_3d, parent_cond, temperature,
+            )
+            # 将 8-way 预测折叠为二值 split:
+            # 任一子节点被占据 → 分裂父节点（创建全部 8 个子节点）
+            split_label = child_8way.any(dim=-1).long().reshape(B * Np)
             octree.octree_split(split_label, depth=depth)
             octree.octree_grow(depth + 1)
 
-            # Recurse
             if isinstance(self.next_fractal, OctreeFractalGen):
                 return self.next_fractal._generate_level(
                     octree, global_cond, temperature, cfg_scale, uncond,
                 )
             else:
-                # Last AR level → GeoHead
-                next_depth = self.config.fractal_levels[-1]
-                next_xyz, _ = get_node_xyz(octree, next_depth)
-                nnum_next = octree.nnum[next_depth]
-                Np_next = nnum_next // B
-                final_xyz = next_xyz.view(B, Np_next, 3)
+                # 下一个是 VQHead → 获取叶子节点并采样 VQ 编码
+                final_depth = self.config.depth_stop
+                leaf_xyz, _ = get_node_xyz(octree, final_depth)
+                nnum_leaf = octree.nnum[final_depth]
+                Np_leaf = nnum_leaf // B
+                leaf_xyz_3d = leaf_xyz.view(B, Np_leaf, 3)
+                leaf_cond = self._make_per_node_cond(
+                    global_cond, nnum_leaf, B)
 
-                occupancy = self.next_fractal.sample(
-                    final_xyz,
-                    self._make_per_node_cond(global_cond, nnum_next, B),
-                    temperature,
+                vq_indices = self.next_fractal.sample(
+                    leaf_xyz_3d, leaf_cond, temperature,
                 )
-                return octree, occupancy
+                return octree, vq_indices
+
         else:
-            # GeoHead level: sample occupancy
-            child_mask = self.next_fractal.sample(
-                parent_xyz_3d, parent_cond, temperature
+            # VQHead 层: 直接采样 VQ 编码
+            vq_indices = self.next_fractal.sample(
+                parent_xyz_3d, parent_cond, temperature,
             )
-            return octree, child_mask
+            return octree, vq_indices
 
 
-# ---------------------------------------------------------------------------
-# Factory functions
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 工厂函数（遵循 FractalGen 命名约定）
+# ------------------------------------------------------------------
 
-def octree_fractal_tiny(config=None):
+def octree_fractal_tiny(config=None, vqvae_wrapper=None):
+    """微型模型，用于快速迭代。"""
     if config is None:
         from src.config import octree_fractal_tiny as make_cfg
         config = make_cfg().model
-    return OctreeFractalGen(config, fractal_level=0)
+    return OctreeFractalGen(config, vqvae_wrapper, fractal_level=0)
 
 
-def octree_fractal_base(config=None):
+def octree_fractal_base(config=None, vqvae_wrapper=None):
+    """基础模型。"""
     if config is None:
         from src.config import octree_fractal_base as make_cfg
         config = make_cfg().model
-    return OctreeFractalGen(config, fractal_level=0)
+    return OctreeFractalGen(config, vqvae_wrapper, fractal_level=0)
 
 
-def octree_fractal_large(config=None):
+def octree_fractal_large(config=None, vqvae_wrapper=None):
+    """大型模型。"""
     if config is None:
         from src.config import octree_fractal_large as make_cfg
         config = make_cfg().model
-    return OctreeFractalGen(config, fractal_level=0)
+    return OctreeFractalGen(config, vqvae_wrapper, fractal_level=0)

@@ -1,0 +1,113 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{graphicx}
+
+\title{3D 分形自回归模型 — Milestone}
+\author{2400013142 欧阳霈}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{选题背景}
+
+\subsection{Fractal Generative Models}
+
+Li et al提出了FractalGen~\cite{li2025fractalgenerativemodels}（arXiv:2502.17437），声称发明了自回归图像生成的新范式：分形自回归生成，即依照模块化思想，从已有的原子生成模块递归地构造出更高级的生成模型。每个自回归模型获得来自上一级生成器的输出（条件向量），并将原图的patch进一步拆分，编码后通过Tranformer处理生成更精细的条件向量下一级生成器的输入，最后输出RGB三通道的256分类的值。
+
+\subsection{OctGPT: Octree-based Multiscale Autoregressive Models for 3D Shape Generation}
+三维形状生成是计算机视觉与图形学领域的一项基础任务：给定一组训练样本（如ShapeNet数据集中的飞机、汽车、椅子等类别的三角网格），学习其底层概率分布$p(\mathcal{S})$，并能够从中采样出新的、合理的、多样的三维形状。该任务在机器人环境理解、AR/VR内容创作、工业设计原型生成等场景中有直接应用。
+
+Wei et al在~\cite{wei2025octgptoctreebasedmultiscaleautoregressive}中提出了一种三维自回归模型，该模型在八叉树导出的序列化多尺度二值token上，使用基于八叉树的、可处理多尺度八叉树节点的拓展Transformer架构，并引入并行token预测方案进行训练。实验证明了自回归模型可以高效的应用于三维形状和场景生成，取得了与最先进的扩散模型相竞争的结果。
+
+
+\subsection{启发}
+
+两种方法都利用多叉树划分空间层级，并完成生成任务。区别在于，~\cite{wei2025octgptoctreebasedmultiscaleautoregressive} 使用单模型迭代所有深度；而~\cite{li2025fractalgenerativemodels} 使用递归调用多模型，完成逐像素生成。
+
+两种方法均依赖多叉树结构来降低自注意力的 $O(N^2)$ 复杂度，但各自存在结构性缺陷，限制了其在三维生成任务中的进一步扩展。
+
+\textbf{FractalGen 的稠密划分假设。}
+FractalGen 的空间分裂是硬编码的固定四分（$2\times2$ grid），并非由模型学习决定。该设计依赖图像数据的稠密性——每个父 patch 必然恰好产生 4 个子 patch，序列长度在各层固定，可直接 reshape 为规整张量做并行前向。然而，将此假设直接迁移至三维八叉树存在根本性困难：
+\begin{enumerate}
+    \item \textbf{全分裂导致复杂度指数增长。} 三维八叉树每次分裂产生 $2\times2\times2=8$ 个子节点。若强制所有节点全部裂到最大深度 $D$，最深层 token 数达到 $O(8^D)$。每深入一层，token 数翻 8 倍，而 2D 仅翻 4 倍。深度 8 时已达约 $2.6\times10^5$ token，深度 10 则超过 $1.6\times10^7$。如不利用稀疏性，深度扩展不可持续。
+    \item \textbf{自然三维形状高度稀疏。} 与稠密图像不同，三维形状的大部分空间为空（如飞机机翼之间的空隙）。强制稠密分裂将大量计算浪费在空区域的建模上，且空节点的存在使训练信号中正负样本严重失衡。
+    \item \textbf{可变序列长度破坏批处理假设。} 实际稀疏八叉树中，各父节点的子节点数可为 0--8。FractalGen 假设每层序列长度固定，无法直接适配变长序列的并行批处理。
+\end{enumerate}
+
+\textbf{OctGPT 的单模型迭代局限性。}
+OctGPT 用一个 OctFormer 处理所有深度的节点，虽借 teacher-forcing attention mask 保证因果性，但架构设计的单一性带来以下问题：
+\begin{enumerate}
+    \item \textbf{容量分配无差异。} 粗尺度（深度 2→3，约 1--8 个节点）决定物体的全局拓扑结构（细长机身 vs.\ 方正车身），细尺度（深度 5→6，数千节点）决定表面微小几何细节。同一 Transformer 参数被均等分配至所有深度，无法向全局结构的关键层级倾斜容量。
+    \item \textbf{训练不灵活。} OctGPT 必须一次性在所有深度上联合训练，内存消耗与最深层的节点数成正比——这使其无法像 ProGAN 那样先训练浅层再逐层添加深层，限制了向更深入叉树扩展的可能性。
+    \item \textbf{跨深度信息流不透明。} 粗、细尺度的节点被拼接为同一序列，teacher-forcing mask 允许细尺度节点 attend 粗尺度节点的 key/value。这种隐式传递缺乏可解释性——难以定量分析粗尺度向细尺度传递了什么信息，各层表示被耦合在同一嵌入空间中，消融实验的变量控制困难。
+\end{enumerate}
+
+需要强调的是，同一深度内的 Masked Prediction 并非 OctGPT 的缺陷。三维八叉树节点在空间上呈稀疏分布，同一深度的节点无天然因果顺序（更接近“集合”而非“序列”），Masked Prediction 对此是合理的设计选择——FractalGen 在 2D 稠密图像上取得成功的因果逐 token 自回归，迁移至 3D 稀疏八叉树未必具有优势。二者真正的本质差异在于跨深度方向的信息传递机制：\textbf{单模型 teacher-forcing attention vs.\ 多模型显式条件向量}。这也是本工作的核心研究问题。
+
+
+\section{核心方法}
+
+\textbf{核心问题。}
+OctGPT 与 FractalGen 的本质差异不在于生成策略（AR vs.\ MAR），而在于跨深度的信息传递机制：\textbf{单模型 teacher-forcing attention vs.\ 多模型显式条件向量}。OctGPT 将所有深度的节点拼接为一个序列，依赖 attention mask 保证因果性，各层共享参数与嵌入空间；FractalGen 则为每层分配独立的 Transformer，层间通过显式条件向量传递信息。本工作将这一对比系统化地引入三维八叉树生成，提出 \textbf{Fractal OctGPT}——一种递归多模型八叉树生成框架，替代 OctGPT 的单模型迭代范式。
+
+% 架构
+\textbf{架构设计。}
+设八叉树深度范围为 $[D_{\text{low}}, D_{\text{high}}]$，构建 $K = D_{\text{high}} - D_{\text{low}}$ 层递归生成器：
+\begin{equation}
+\text{3D-FractalGen}(D_{\text{low}}=2, D_{\text{high}}=6):
+\quad
+\begin{cases}
+\text{Level } 0\;(2\to 3):\; \text{Masked Transformer, } \leq 8 \text{ 个节点的 split}\\[4pt]
+\text{Level } 1\;(3\to 4):\; \text{Masked Transformer, } \leq 64 \text{ 个节点的 split}\\[4pt]
+\text{Level } 2\;(4\to 5):\; \text{Masked Transformer, } \leq 512 \text{ 个节点的 split}\\[4pt]
+\text{GeoHead}\;(5\to6):\; \text{轻量 Transformer + MLP, 几何特征输出}
+\end{cases}
+\end{equation}
+
+生成流程自顶向下递归：Level $0$ 接收类别嵌入（或无条件隐变量），预测根节点的 8 个子节点的分裂状态，并为每个 split 子节点输出条件向量。条件向量传入 Level $1$，作为其 Transformer 前缀 token，指导该层预测更深层的分裂。递归直至 GeoHead，最终输出每个叶节点的几何占用率（occupancy）或 VQ codebook 索引，经 Marching Cubes 或 VQ-VAE Decoder 恢复三角网格。
+
+同一深度内的生成沿袭 OctGPT 的 Masked Prediction 策略（cosine schedule）。如前文所述，三维稀疏八叉树节点更接近“集合”而非“序列”，MAR 是合理选择，且与核心研究问题（跨深度信息传递）正交。
+
+% 关键设计要点
+\textbf{关键设计要点。}
+本框架在以下维度做了针对性设计：
+
+\begin{enumerate}
+    \item \textbf{层自适应架构分配（Level-Adaptive Architecture）。} 沿袭 FractalGen 的递减分配策略：粗尺度（决定全局结构）使用更大 Transformer，细尺度（填充局部细节）使用轻量 Transformer。每层同时包含两个 head：(i) 条件向量 head，供下一层作为前缀 token；(ii) 分裂预测 head，以二值分类输出 8 个子节点的 split。这是 FractalGen 固定稠密分裂的三维泛化，也是“递归多模型 vs.\ 单模型”比较的核心维度。
+
+    \item \textbf{跨层空间条件机制（Spatial Conditioning）。} FractalGen 二维版本使用 5 个固定邻居（上、下、左、右、中）传递条件。三维八叉树邻域更复杂：基础方案为 7 邻域（6 个面邻居 + 自身），扩展方案可选用 19 或 27 邻域。对稀疏八叉树中不存在的邻居，引入可学习的空嵌入（Learnable Empty Embedding）。该显式条件传递可直接与 OctGPT 的隐式跨深度 attention 做消融对比。
+
+    \item \textbf{双输出头与联合损失。} 每层 Transformer 输出的表示同时送入两个 MLP head：
+    \begin{itemize}
+        \item 分裂头（Split Head）：对每个节点预测 8 个子节点的二值分裂分类，损失为 Binary Cross-Entropy。
+        \item 条件头（Condition Head）：输出该层条件向量，经线性投影后作为下一层输入序列的前缀 token。
+    \end{itemize}
+    最终 GeoHead 以 BCE（occupancy 直出）或 Cross-Entropy（VQ codebook）训练。
+\end{enumerate}
+
+% Phase 计划
+\textbf{实验路线。}
+实验分三阶段推进：
+\begin{enumerate}
+    \item \textbf{Phase 1（最简可行验证）：} 2 层递归（深度 2→4），Occupancy 直出 + Marching Cubes。轻量 Transformer（16 + 4 blocks），ShapeNet 飞机类。目标：验证递归八叉树生成训练收敛，生成质量不低于同参数量 OctGPT 单模型 baseline。
+    \item \textbf{Phase 2（完整架构 + 主线消融）：} 扩展到 4 层递归（深度 2→6），接入 VQ-VAE backbone（复用 OctGPT 预训练 VQ-VAE），支持无条件/类别条件生成。主线实验：\textbf{递归多模型 vs.\ OctGPT 单模型}，控制总参数量。核心消融：(i) condition 形式（7/19/27 邻域 vs.\ teacher-forcing attention）；(ii) 层级容量分配（递减 vs.\ 均等 vs.\ 递增）。评估指标：Chamfer Distance、F-Score、生成速度、GPU 峰值内存。
+    \item \textbf{Phase 3（派生方向）：} 渐进式训练策略、多条件（文本/图像）扩展、更大规模类别（Objaverse）验证。
+\end{enumerate}
+
+\section{实验进展}
+
+精读两篇论文，完成了代码框架的搭建，等待Shapenet通过我的注册申请，向我开放数据集获取。
+
+
+
+\bibliographystyle{plain}
+\bibliography{ref}
+
+\end{document}

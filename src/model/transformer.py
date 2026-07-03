@@ -1,11 +1,11 @@
 """
-Shared Transformer components adapted from FractalGen's ar.py for 3D octree nodes.
+共享 Transformer 组件，从 FractalGen 的 ar.py 适配到 3D 八叉树节点。
 
-Key adaptations:
-- 3D Rotary Position Embedding (RoPE) computed from node xyz coordinates
-  instead of 2D grid positions
-- DropPath (Stochastic Depth) for regularization
-- SwiGLU FeedForward Network (same as FractalGen AR)
+关键适配:
+- 3D Rotary Position Embedding (RoPE): 从节点 xyz 坐标动态计算，
+  而非 2D 网格预计算
+- DropPath (Stochastic Depth) 正则化
+- SwiGLU FeedForward Network（与 FractalGen AR 一致）
 """
 
 import math
@@ -17,12 +17,12 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
-# DropPath (Stochastic Depth)
+# DropPath（随机深度）
 # ---------------------------------------------------------------------------
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False,
               scale_by_keep: bool = True) -> torch.Tensor:
-    """Drop paths per sample in residual blocks (Stochastic Depth)."""
+    """在残差 block 中按样本随机丢弃路径（Stochastic Depth）。"""
     if drop_prob == 0.0 or not training:
         return x
     keep_prob = 1 - drop_prob
@@ -34,7 +34,7 @@ def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False,
 
 
 class DropPath(nn.Module):
-    """DropPath as a nn.Module."""
+    """nn.Module 包装的 DropPath。"""
 
     def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
         super().__init__()
@@ -50,9 +50,14 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (used in FractalGen AR / Llama)."""
+    """Root Mean Square Layer Normalization（FractalGen AR / Llama 风格）。
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    参数:
+        dim: 特征维度
+        eps: 数值稳定性系数
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -66,21 +71,21 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# FeedForward (SwiGLU)
+# FeedForward（SwiGLU）
 # ---------------------------------------------------------------------------
 
 def find_multiple(n: int, k: int) -> int:
-    """Round n up to the nearest multiple of k."""
+    """将 n 向上取整到 k 的最近倍数。"""
     if n % k == 0:
         return n
     return n + k - (n % k)
 
 
 class FeedForward(nn.Module):
-    """SwiGLU FeedForward block (Llama-style).
+    """SwiGLU FeedForward block（Llama 风格）。
 
     FFN(x) = w2(silu(w1(x)) * w3(x))
-    Hidden dim = 2/3 * 4 * dim, rounded to multiple_of.
+    隐藏维度 = 2/3 * 4 * dim，向上取整到 multiple_of。
     """
 
     def __init__(self, dim: int, multiple_of: int = 256,
@@ -95,11 +100,12 @@ class FeedForward(nn.Module):
 
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)  # gate
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)  # value
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)  # output
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)  # 输出
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.w2(nn.functional.silu(self.w1(x)) * self.w3(x)))
+        return self.dropout(
+            self.w2(nn.functional.silu(self.w1(x)) * self.w3(x)))
 
 
 # ---------------------------------------------------------------------------
@@ -107,68 +113,71 @@ class FeedForward(nn.Module):
 # ---------------------------------------------------------------------------
 
 def precompute_freqs_cis_3d(
-    xyz: torch.Tensor,  # (N, 3) — node coordinates at a given depth
+    xyz: torch.Tensor,
     dim: int,
     base: float = 10000.0,
 ) -> torch.Tensor:
-    """Compute 3D RoPE frequencies for arbitrary node positions.
+    """为任意节点位置计算 3D RoPE 频率。
 
-    Splits the head dimension into 3 equal parts for x, y, z axes.
-    Each axis encodes position using standard RoPE frequency bands.
+    将 head 维度等分为 3 份，分别对应 x、y、z 轴。
+    每轴使用标准 RoPE 频率带编码位置。
 
-    Args:
-        xyz: (N, 3) float tensor of node coordinates in [0, 2^depth)
-        dim: head dimension (dim // num_heads)
-        base: RoPE base frequency
+    参数:
+        xyz: (N, 3) float 张量，节点坐标在 [0, 2^depth) 范围内
+        dim: head 维度（dim // num_heads）
+        base: RoPE 基频
 
-    Returns:
-        freqs_cis: (N, dim // 2, 2) complex representation [cos, sin]
+    返回:
+        freqs_cis: (N, dim // 2, 2) 复数表示 [cos, sin]
     """
     N = xyz.shape[0]
     third_dim = dim // 3
-    # Use only even frequencies within each third
+    # 每三分之一内仅使用偶数频率
     n_elem = (third_dim // 2) * 2
 
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=xyz.device).float() / n_elem))
-    # freqs: (n_elem // 2,)
+    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2,
+                                         device=xyz.device).float() / n_elem))
 
-    # Compute outer product for each axis
+    # 每轴计算外积
     freqs_x = torch.outer(xyz[:, 0], freqs)  # (N, n_elem // 2)
     freqs_y = torch.outer(xyz[:, 1], freqs)
     freqs_z = torch.outer(xyz[:, 2], freqs)
 
-    # Pad each to third_dim // 2 (handle odd dimensions)
+    # 填充到 third_dim // 2（处理奇数维度）
     pad_len = third_dim // 2 - freqs_x.shape[1]
     if pad_len > 0:
-        freqs_x = torch.cat([freqs_x, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
-        freqs_y = torch.cat([freqs_y, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
-        freqs_z = torch.cat([freqs_z, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
+        freqs_x = torch.cat(
+            [freqs_x, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
+        freqs_y = torch.cat(
+            [freqs_y, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
+        freqs_z = torch.cat(
+            [freqs_z, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
 
-    # Concatenate: [freqs_x | freqs_y | freqs_z] → (N, 3 * third_dim // 2) = (N, dim // 2)
+    # 拼接: [freqs_x | freqs_y | freqs_z] → (N, dim // 2)
     freqs_cat = torch.cat([freqs_x, freqs_y, freqs_z], dim=1)
 
-    # Convert to complex representation [cos, sin]
+    # 转换为复数表示 [cos, sin]
     freqs_cis = torch.stack([torch.cos(freqs_cat), torch.sin(freqs_cat)], dim=-1)
-    return freqs_cis  # (N, dim // 2, 2)
+    return freqs_cis
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding to a tensor.
+    """对张量施加 rotary position embedding。
 
-    Args:
+    参数:
         x: (B, seq_len, n_head, head_dim)
-        freqs_cis: (seq_len, head_dim // 2, 2) — [cos, sin] per position
+        freqs_cis: (seq_len, head_dim // 2, 2) — 每位置的 [cos, sin]
 
-    Returns:
-        x with RoPE applied, same shape as input
+    返回:
+        施加 RoPE 后的 x，形状不变
     """
     B, seq_len, n_head, head_dim = x.shape
-    # Reshape x to complex pairs
+    # 将 x 重塑为复数对
     xshaped = x.float().reshape(B, seq_len, n_head, head_dim // 2, 2)
-    # Reshape freqs_cis for broadcasting
+    # 重塑 freqs_cis 以进行广播
     freqs_cis = freqs_cis.view(1, seq_len, 1, head_dim // 2, 2)
 
-    # Apply rotation: (a+bi) * (cos θ + i sin θ)
+    # 施加旋转: (a+bi) * (cos θ + i sin θ)
     x_out2 = torch.stack([
         xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
         xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
@@ -183,7 +192,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
-    """Multi-Head Self-Attention with optional KV-cache and 3D RoPE."""
+    """多头自注意力，支持可选的 KV-cache 和 3D RoPE。
+
+    参数:
+        dim: 嵌入维度
+        n_head: 查询头数
+        n_kv_head: KV 头数（GQA，默认等于 n_head）
+        attn_drop: 注意力 dropout 率
+        proj_drop: 输出投影 dropout 率
+    """
 
     def __init__(self, dim: int, n_head: int, n_kv_head: Optional[int] = None,
                  attn_drop: float = 0.0, proj_drop: float = 0.0):
@@ -195,14 +212,14 @@ class Attention(nn.Module):
         self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
         total_kv_dim = (n_head + 2 * self.n_kv_head) * self.head_dim
 
-        # Combined QKV projection
+        # 合并 QKV 投影
         self.wqkv = nn.Linear(dim, total_kv_dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
 
         self.attn_dropout_p = attn_drop
         self.resid_dropout = nn.Dropout(proj_drop)
 
-        # KV-cache (used during inference)
+        # KV-cache（推理时使用）
         self.kv_cache: Optional['KVCache'] = None
 
     def forward(
@@ -213,29 +230,30 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Args:
+        参数:
             x: (B, seq_len, dim)
-            freqs_cis: (seq_len, head_dim//2, 2) for RoPE
-            input_pos: (seq_len,) for KV-cache indexing
-            mask: (seq_len, seq_len) attention mask, or None for causal
+            freqs_cis: (seq_len, head_dim//2, 2) 用于 RoPE
+            input_pos: (seq_len,) 用于 KV-cache 索引
+            mask: (seq_len, seq_len) 注意力 mask，或 None 表示 causal
 
-        Returns:
+        返回:
             (B, seq_len, dim)
         """
         B, seqlen, _ = x.shape
         kv_size = self.n_kv_head * self.head_dim
-        xq, xk, xv = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        xq, xk, xv = self.wqkv(x).split(
+            [self.dim, kv_size, kv_size], dim=-1)
 
         xq = xq.view(B, seqlen, self.n_head, self.head_dim)
         xk = xk.view(B, seqlen, self.n_kv_head, self.head_dim)
         xv = xv.view(B, seqlen, self.n_kv_head, self.head_dim)
 
-        # Apply 3D RoPE
+        # 施加 3D RoPE
         if freqs_cis is not None:
             xq = apply_rotary_emb(xq, freqs_cis)
             xk = apply_rotary_emb(xk, freqs_cis)
 
-        # Transpose to (B, n_head, seqlen, head_dim)
+        # 转置为 (B, n_head, seqlen, head_dim)
         xq, xk, xv = map(lambda t: t.transpose(1, 2), (xq, xk, xv))
 
         # KV-cache
@@ -244,11 +262,11 @@ class Attention(nn.Module):
         else:
             keys, values = xk, xv
 
-        # GQA: expand KV heads to match Q heads
+        # GQA: 扩展 KV 头以匹配 Q 头
         keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
         values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
 
-        # Scaled dot-product attention
+        # 缩放点积注意力
         is_causal = mask is None
         output = nn.functional.scaled_dot_product_attention(
             xq, keys, values,
@@ -267,7 +285,14 @@ class Attention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class KVCache(nn.Module):
-    """Key-Value cache for autoregressive inference."""
+    """自回归推理的键值缓存。
+
+    参数:
+        max_batch_size: 最大 batch 大小
+        max_seq_length: 最大序列长度
+        n_head: 注意力头数
+        head_dim: 每头维度
+    """
 
     def __init__(self, max_batch_size: int, max_seq_length: int,
                  n_head: int, head_dim: int):
@@ -278,7 +303,7 @@ class KVCache(nn.Module):
 
     def update(self, input_pos: torch.Tensor, k_val: torch.Tensor,
                v_val: torch.Tensor):
-        """Write new K, V at input_pos into the cache."""
+        """在 input_pos 位置写入新的 K、V 到缓存中。"""
         k_out = self.k_cache
         v_out = self.v_cache
         k_out[:, :, input_pos] = k_val.to(k_out.dtype)
@@ -291,9 +316,9 @@ class KVCache(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: Attention + SwiGLU FFN.
+    """Pre-norm Transformer block: Attention + SwiGLU FFN。
 
-    Layout:
+    布局:
         x = x + DropPath(Attention(RMSNorm(x)))
         x = x + DropPath(FFN(RMSNorm(x)))
     """
@@ -301,7 +326,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_head: int, n_kv_head: Optional[int] = None,
                  mlp_drop: float = 0.0, attn_drop: float = 0.0,
                  proj_drop: float = 0.0, drop_path: float = 0.0,
-                 norm_eps: float = 1e-6):
+                 norm_eps: float = 1e-5):
         super().__init__()
         self.attention = Attention(
             dim=dim, n_head=n_head, n_kv_head=n_kv_head,
@@ -319,10 +344,10 @@ class TransformerBlock(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Attention sub-block
+        # Attention 子 block
         h = x + self.drop_path(
             self.attention(self.attention_norm(x), freqs_cis, input_pos, mask)
         )
-        # FFN sub-block
+        # FFN 子 block
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out

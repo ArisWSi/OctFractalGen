@@ -1,15 +1,15 @@
 """
-ShapeNet data loading for occupancy-only octree generation.
+ShapeNet 数据加载，用于八叉树 occupancy 生成。
 
-Adapted from OctGPT's datasets/shapenet.py. Stripped down to only the
-point cloud → octree path (no SDF loading, no image/text conditioning).
+从 OctGPT 的 datasets/shapenet.py 适配。精简为仅包含
+点云 → 八叉树路径（无 SDF 加载、无图像/文本条件）。
 
-Pipeline:
-    1. ReadFile: load pointcloud.npz from sample directory
-    2. TransformShape: points → ocnn.Octree (via build_octree)
-    3. collate_func: batch octrees via ocnn.dataset.CollateBatch
+管线:
+    1. ReadFile: 从样本目录加载 pointcloud.npz
+    2. TransformShape: 点云 → ocnn.Octree（通过 build_octree）
+    3. collate_func: 通过 ocnn.dataset.CollateBatch 批量合并八叉树
 
-Usage:
+用法:
     from src.data.shapenet import get_shapenet_dataset
     dataset, collate_fn = get_shapenet_dataset(data_config)
 """
@@ -21,40 +21,31 @@ import numpy as np
 import torch
 
 
-def _get_ocnn_available():
-    """Check if ocnn is importable."""
-    try:
-        import ocnn  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 # ---------------------------------------------------------------------------
-# ReadFile: load preprocessed point cloud from disk
+# ReadFile: 从磁盘加载预处理的点云
 # ---------------------------------------------------------------------------
 
 class ReadFile:
-    """Load pointcloud.npz from a sample directory.
+    """从样本目录加载 pointcloud.npz。
 
-    Expected directory structure:
+    预期的目录结构:
         {location}/{sample_id}/
-            pointcloud.npz  — with keys 'points' (N,3) and 'normals' (N,3)
+            pointcloud.npz — 包含 keys 'points' (N,3) 和 'normals' (N,3)
 
-    The sample_id is derived from the last 2 path components of the filelist entry.
+    sample_id 从 filelist 条目的最后两个路径分量推导。
     """
 
     def __init__(self, flags):
         self.flags = flags
 
     def __call__(self, filename: str) -> Dict:
-        """Load point cloud from disk.
+        """从磁盘加载点云。
 
-        Args:
-            filename: path to sample directory (from filelist)
+        参数:
+            filename: 样本目录路径（来自 filelist）
 
-        Returns:
-            dict with key 'point_cloud' → {'points': (N,3), 'normals': (N,3)}
+        返回:
+            含 'point_cloud' → {'points': (N,3), 'normals': (N,3)} 的 dict
         """
         output = {}
         filename_pc = os.path.join(filename, 'pointcloud.npz')
@@ -67,21 +58,20 @@ class ReadFile:
 
 
 # ---------------------------------------------------------------------------
-# TransformShape: point cloud → octree
+# TransformShape: 点云 → 八叉树
 # ---------------------------------------------------------------------------
 
 class TransformShape:
-    """Convert point cloud to ocnn Octree.
+    """将点云转换为 ocnn Octree。
 
-    The octree is built by ocnn's Octree.build_octree() from surface points.
-    This gives us the ground truth octree structure (which voxels are occupied
-    at each depth).
+    八叉树由 ocnn 的 Octree.build_octree() 从表面点云构建。
+    这为每个深度提供了 ground truth 八叉树结构（哪些体素被占据）。
 
-    Key parameters:
-        depth: maximum octree depth (e.g., 6)
-        full_depth: minimum depth with full resolution (e.g., 3)
-        points_scale: input points are in [-points_scale, points_scale],
-                      rescaled to [-1, 1] for ocnn
+    关键参数:
+        depth: 最大八叉树深度（例如 6）
+        full_depth: 全分辨率的最小深度（例如 3）
+        points_scale: 输入点云在 [-points_scale, points_scale] 范围内，
+                      重缩放至 [-1, 1] 供 ocnn 使用
     """
 
     def __init__(self, flags):
@@ -92,14 +82,14 @@ class TransformShape:
         self.max_points = getattr(flags, 'max_points', 120000)
 
     def points2octree(self, points, normals=None):
-        """Build ocnn Octree from point cloud.
+        """从点云构建 ocnn Octree。
 
-        Args:
-            points: (N, 3) float tensor
-            normals: (N, 3) float tensor (optional)
+        参数:
+            points: (N, 3) float 张量
+            normals: (N, 3) float 张量（可选）
 
-        Returns:
-            ocnn.Octree object
+        返回:
+            ocnn.Octree 对象
         """
         import ocnn
         from ocnn.octree import Octree, Points
@@ -107,7 +97,8 @@ class TransformShape:
         if normals is not None:
             pts = Points(points=points.cpu(), normals=normals.cpu())
         else:
-            pts = Points(points=points.cpu(), normals=torch.zeros_like(points.cpu()))
+            pts = Points(points=points.cpu(),
+                         normals=torch.zeros_like(points.cpu()))
 
         pts.clip(min=-1, max=1)
         octree = Octree(self.depth, self.full_depth)
@@ -115,34 +106,32 @@ class TransformShape:
         return octree
 
     def process_points_cloud(self, sample: Dict) -> Dict:
-        """Build octree from point cloud sample.
+        """从点云样本构建八叉树。
 
-        Args:
-            sample: dict with 'point_cloud' → {'points': array, 'normals': array}
+        参数:
+            sample: 含 'point_cloud' → {'points': array, 'normals': array} 的 dict
 
-        Returns:
-            dict with 'octree_gt': ocnn.Octree
+        返回:
+            含 'octree_gt': ocnn.Octree 的 dict
         """
-        # Load points and scale to [-1, 1]
+        # 加载点云并缩放至 [-1, 1]
         points_np = sample['points'].astype(np.float32)
         normals_np = sample['normals'].astype(np.float32)
 
         points = torch.from_numpy(points_np).float()
         normals = torch.from_numpy(normals_np).float()
 
-        # Scale points to [-1, 1]
+        # 缩放点云至 [-1, 1]
         points = points / self.points_scale
-        # Normals are unaffected by uniform scaling
 
-        # Randomly drop points if exceeding max_points (avoid OOM)
+        # 若超过 max_points 则随机丢弃（避免 OOM）
         if self.max_points and points.shape[0] > self.max_points:
             rand_idx = np.random.choice(
-                points.shape[0], size=self.max_points, replace=False
-            )
+                points.shape[0], size=self.max_points, replace=False)
             points = points[rand_idx]
             normals = normals[rand_idx]
 
-        # Build octree
+        # 构建八叉树
         octree_gt = self.points2octree(points, normals)
 
         return {
@@ -152,14 +141,14 @@ class TransformShape:
         }
 
     def __call__(self, sample: Dict, idx: int) -> Dict:
-        """Full transform: point cloud → octree.
+        """完整变换: 点云 → 八叉树。
 
-        Args:
-            sample: output from ReadFile
-            idx: sample index (unused)
+        参数:
+            sample: ReadFile 的输出
+            idx: 样本索引（未使用）
 
-        Returns:
-            dict with 'octree_gt'
+        返回:
+            含 'octree_gt' 的 dict
         """
         output = {}
         output.update(self.process_points_cloud(sample['point_cloud']))
@@ -167,39 +156,39 @@ class TransformShape:
 
 
 # ---------------------------------------------------------------------------
-# Collate function
+# Collate 函数
 # ---------------------------------------------------------------------------
 
 def collate_func(batch):
-    """Collate a list of samples into a batch.
+    """将样本列表合并为一个 batch。
 
-    Uses ocnn's CollateBatch for proper octree merging.
+    使用 ocnn 的 CollateBatch 进行正确的八叉树合并。
     """
     import ocnn
     return ocnn.dataset.CollateBatch(merge_points=False)(batch)
 
 
 # ---------------------------------------------------------------------------
-# Dataset factory
+# Dataset 工厂
 # ---------------------------------------------------------------------------
 
 def get_shapenet_dataset(flags) -> Tuple:
-    """Create ShapeNet dataset and collate function.
+    """创建 ShapeNet 数据集和 collate 函数。
 
-    Args:
-        flags: DataConfig-like object with:
-            - location: path to dataset root
-            - filelist: path to text file listing sample dirs
+    参数:
+        flags: 类 DataConfig 对象，包含:
+            - location: 数据集根路径
+            - filelist: 列出样本目录的文本文件路径
             - depth, full_depth, points_scale, max_points
 
-    Returns:
-        (dataset, collate_func) tuple
+    返回:
+        (dataset, collate_func) 元组
     """
-    # Lazy import to avoid hard dependency at module level
+    # 延迟导入以避免模块级别的硬依赖
     try:
         from thsolver import Dataset
     except ImportError:
-        # Fallback: use a simple list-based dataset
+        # 回退: 使用简单的基于列表的 dataset
         return _simple_dataset(flags), collate_func
 
     transform = TransformShape(flags)
@@ -209,10 +198,7 @@ def get_shapenet_dataset(flags) -> Tuple:
 
 
 def _simple_dataset(flags):
-    """Fallback dataset using plain list of file paths.
-
-    Does NOT use thsolver.Dataset — reads filelist directly.
-    """
+    """不使用 thsolver.Dataset 的回退 dataset——直接读取 filelist。"""
     with open(flags.filelist, 'r') as f:
         filenames = [os.path.join(flags.location, line.strip().split()[0])
                      for line in f if line.strip()]
@@ -221,7 +207,7 @@ def _simple_dataset(flags):
 
 
 class _SimpleShapeNetDataset(torch.utils.data.Dataset):
-    """Minimal ShapeNet dataset without thsolver dependency."""
+    """不依赖 thsolver 的最小 ShapeNet 数据集。"""
 
     def __init__(self, filenames, flags):
         self.filenames = filenames

@@ -1,18 +1,20 @@
 [project]
 name = "octree-fractalgen"
 version = "0.1.0"
-description = "Recursive Multi-Model Octree Generation — Direction 5 Occupancy-Only Pipeline"
+description = "Recursive Multi-Model Octree Generation with VQ-VAE"
 requires-python = ">=3.10"
 
 dependencies = [
     "torch>=2.5",
     "ocnn>=2.2",
+    "ognn>=0.1",
     "trimesh>=4.0",
     "scikit-image>=0.22",
     "numpy>=1.26",
     "scipy>=1.12",
     "tqdm>=4.66",
     "tensorboard>=2.16",
+    "pyyaml>=6.0",
 ]
 
 [tool.uv]
