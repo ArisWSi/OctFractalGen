@@ -113,51 +113,58 @@ def pairwise_cd_emd(
     sample_pcs: torch.Tensor,
     ref_pcs: torch.Tensor,
     batch_size: int = 64,
+    compute_emd: bool = False,
 ) -> tuple:
-    """Compute pairwise CD and EMD between all sample-ref pairs.
+    """Compute pairwise CD (and optionally EMD) between all sample-ref pairs.
 
     For each generated shape, compute distance to every reference shape.
+    EMD is disabled by default because scipy linear_sum_assignment is
+    O(N^3) on CPU — infeasible for >~100 shapes at 2048 points.
 
     Args:
         sample_pcs: (N_sample, num_points, 3) generated point clouds
         ref_pcs:    (N_ref, num_points, 3) reference point clouds
         batch_size: ref batch size for memory efficiency
+        compute_emd: if True, also compute EMD (very slow for large sets)
 
     Returns:
         all_cd:  (N_sample, N_ref) pairwise Chamfer distances
-        all_emd: (N_sample, N_ref) pairwise EMD values
+        all_emd: (N_sample, N_ref) pairwise EMD, or None if compute_emd=False
     """
     N_sample = sample_pcs.shape[0]
     N_ref = ref_pcs.shape[0]
 
+    desc = "Pairwise CD/EMD" if compute_emd else "Pairwise CD"
     all_cd = []
-    all_emd = []
+    all_emd = [] if compute_emd else None
 
-    for s_idx in tqdm(range(N_sample), desc="Pairwise CD/EMD"):
+    for s_idx in tqdm(range(N_sample), desc=desc):
         sample_i = sample_pcs[s_idx:s_idx + 1]  # (1, N, 3)
 
         cd_list = []
-        emd_list = []
+        emd_list = [] if compute_emd else None
         for r_start in range(0, N_ref, batch_size):
             r_end = min(N_ref, r_start + batch_size)
             ref_batch = ref_pcs[r_start:r_end]           # (B, N, 3)
             B_ref = ref_batch.size(0)
 
-            # Expand single sample to match ref batch
             sample_exp = sample_i.expand(B_ref, -1, -1).contiguous()
 
             dl, dr = dist_chamfer(sample_exp, ref_batch)
             cd = (dl.mean(dim=1) + dr.mean(dim=1)).view(1, -1)
             cd_list.append(cd)
 
-            emd_batch = emd_approx(sample_exp, ref_batch)
-            emd_list.append(emd_batch.view(1, -1))
+            if compute_emd:
+                emd_batch = emd_approx(sample_exp, ref_batch)
+                emd_list.append(emd_batch.view(1, -1))
 
-        all_cd.append(torch.cat(cd_list, dim=1))     # (1, N_ref)
-        all_emd.append(torch.cat(emd_list, dim=1))
+        all_cd.append(torch.cat(cd_list, dim=1))
+        if compute_emd:
+            all_emd.append(torch.cat(emd_list, dim=1))
 
     all_cd = torch.cat(all_cd, dim=0)    # (N_sample, N_ref)
-    all_emd = torch.cat(all_emd, dim=0)
+    if compute_emd:
+        all_emd = torch.cat(all_emd, dim=0)
     return all_cd, all_emd
 
 
@@ -260,27 +267,31 @@ def compute_cov_mmd(
     sample_pcs: torch.Tensor,
     ref_pcs: torch.Tensor,
     batch_size: int = 64,
+    compute_emd: bool = False,
 ) -> Dict[str, float]:
-    """Compute COV and MMD metrics (CD and EMD variants).
+    """Compute COV and MMD metrics (CD, and optionally EMD).
 
     Args:
         sample_pcs: (N_sample, N, 3) generated point clouds
         ref_pcs:    (N_ref, N, 3) reference point clouds
         batch_size: batch size for pairwise computation
+        compute_emd: if True, also compute EMD-based metrics
 
     Returns:
-        dict with keys: COV-CD, MMD-CD, COV-EMD, MMD-EMD
+        dict with keys: COV-CD, MMD-CD, [COV-EMD, MMD-EMD if compute_emd]
     """
-    M_rs_cd, M_rs_emd = pairwise_cd_emd(ref_pcs, sample_pcs, batch_size)
+    M_rs_cd, M_rs_emd = pairwise_cd_emd(
+        ref_pcs, sample_pcs, batch_size, compute_emd=compute_emd)
 
     results = {}
     res_cd = _lgan_mmd_cov(M_rs_cd.t())
     results['COV-CD'] = res_cd.get('lgan_cov', 0.0)
     results['MMD-CD'] = res_cd.get('lgan_mmd', 0.0)
 
-    res_emd = _lgan_mmd_cov(M_rs_emd.t())
-    results['COV-EMD'] = res_emd.get('lgan_cov', 0.0)
-    results['MMD-EMD'] = res_emd.get('lgan_mmd', 0.0)
+    if compute_emd and M_rs_emd is not None:
+        res_emd = _lgan_mmd_cov(M_rs_emd.t())
+        results['COV-EMD'] = res_emd.get('lgan_cov', 0.0)
+        results['MMD-EMD'] = res_emd.get('lgan_mmd', 0.0)
 
     return results
 
@@ -289,8 +300,9 @@ def compute_1_nna(
     sample_pcs: torch.Tensor,
     ref_pcs: torch.Tensor,
     batch_size: int = 64,
+    compute_emd: bool = False,
 ) -> Dict[str, float]:
-    """Compute 1-NNA metrics (CD and EMD variants).
+    """Compute 1-NNA metrics (CD, and optionally EMD).
 
     Closer to 50% accuracy means generated shapes are indistinguishable
     from real shapes.
@@ -299,23 +311,25 @@ def compute_1_nna(
         sample_pcs: (N_sample, N, 3)
         ref_pcs:    (N_ref, N, 3)
         batch_size: batch size
+        compute_emd: if True, also compute EMD-based 1-NNA
 
     Returns:
-        dict with keys: 1-NNA-CD-acc, 1-NNA-EMD-acc
+        dict with keys: 1-NNA-CD-acc, [1-NNA-EMD-acc if compute_emd]
     """
-    # Cross distances: ref ↔ sample
-    M_rs_cd, M_rs_emd = pairwise_cd_emd(ref_pcs, sample_pcs, batch_size)
-
-    # Within-set distances
-    # For ref ↔ ref: re-use pairwise function
-    M_rr_cd, M_rr_emd = pairwise_cd_emd(ref_pcs, ref_pcs, batch_size)
-    M_ss_cd, M_ss_emd = pairwise_cd_emd(sample_pcs, sample_pcs, batch_size)
+    M_rs_cd, M_rs_emd = pairwise_cd_emd(
+        ref_pcs, sample_pcs, batch_size, compute_emd=compute_emd)
+    M_rr_cd, M_rr_emd = pairwise_cd_emd(
+        ref_pcs, ref_pcs, batch_size, compute_emd=compute_emd)
+    M_ss_cd, M_ss_emd = pairwise_cd_emd(
+        sample_pcs, sample_pcs, batch_size, compute_emd=compute_emd)
 
     results = {}
     one_nn_cd = _knn(M_rr_cd, M_rs_cd, M_ss_cd, k=1, sqrt=False)
     results.update({f"1-NNA-CD-{k}": v for k, v in one_nn_cd.items()})
-    one_nn_emd = _knn(M_rr_emd, M_rs_emd, M_ss_emd, k=1, sqrt=False)
-    results.update({f"1-NNA-EMD-{k}": v for k, v in one_nn_emd.items()})
+
+    if compute_emd and M_rs_emd is not None:
+        one_nn_emd = _knn(M_rr_emd, M_rs_emd, M_ss_emd, k=1, sqrt=False)
+        results.update({f"1-NNA-EMD-{k}": v for k, v in one_nn_emd.items()})
 
     return results
 
@@ -328,6 +342,7 @@ def compute_all_metrics(
     sample_pcs: torch.Tensor,
     ref_pcs: torch.Tensor,
     batch_size: int = 64,
+    compute_emd: bool = False,
     device: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, float]:
@@ -337,12 +352,13 @@ def compute_all_metrics(
         sample_pcs: (N_sample, N_points, 3) generated point clouds
         ref_pcs:    (N_ref, N_points, 3) reference point clouds
         batch_size: batch size for pairwise computation
+        compute_emd: if True, also compute EMD metrics (slow for >100 samples)
         device: torch device (auto-detect if None)
         verbose: print progress
 
     Returns:
-        dict with 1-NNA-CD-acc, 1-NNA-EMD-acc, COV-CD, COV-EMD,
-             MMD-CD, MMD-EMD
+        dict with 1-NNA-CD-acc, COV-CD, MMD-CD,
+             [1-NNA-EMD-acc, COV-EMD, MMD-EMD if compute_emd]
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -351,12 +367,15 @@ def compute_all_metrics(
     ref_pcs = ref_pcs.to(device)
 
     if verbose:
-        print(f"Computing metrics: {sample_pcs.shape[0]} samples "
+        emd_note = " + EMD" if compute_emd else ""
+        print(f"Computing metrics (CD{emd_note}): {sample_pcs.shape[0]} samples "
               f"vs {ref_pcs.shape[0]} references on {device}")
 
     results = {}
-    results.update(compute_1_nna(sample_pcs, ref_pcs, batch_size))
-    results.update(compute_cov_mmd(sample_pcs, ref_pcs, batch_size))
+    results.update(compute_1_nna(sample_pcs, ref_pcs, batch_size,
+                                  compute_emd=compute_emd))
+    results.update(compute_cov_mmd(sample_pcs, ref_pcs, batch_size,
+                                    compute_emd=compute_emd))
 
     if verbose:
         print("\n--- Evaluation Results ---")

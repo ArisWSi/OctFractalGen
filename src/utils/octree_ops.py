@@ -220,28 +220,40 @@ def get_split_labels(octree, depth: int) -> torch.Tensor:
     cx, cy, cz, cb = octree.xyzb(depth + 1, nempty=False)
     px, py, pz, pb = octree.xyzb(depth, nempty=False)
 
-    # 父坐标 = 子坐标 // 2
+    # 子节点 → 父节点 和 octant
     child_parent_x = cx // 2
     child_parent_y = cy // 2
     child_parent_z = cz // 2
-    oct_x = cx % 2
-    oct_y = cy % 2
-    oct_z = cz % 2
-    octant = oct_x + 2 * oct_y + 4 * oct_z  # 0-7
+    octant = (cx & 1) + 2 * (cy & 1) + 4 * (cz & 1)  # 0–7
 
-    # 构建父节点查找表: (batch, x, y, z) → parent_index
-    parent_lookup = {}
-    for p in range(nnum_d):
-        key = (int(pb[p]), int(px[p]), int(py[p]), int(pz[p]))
-        parent_lookup[key] = p
+    # ---- 向量化匹配: 1D 哈希键 + searchsorted ----
+    S = 2 ** depth  # 坐标范围 [0, S-1]
 
-    # 匹配子节点到父节点
-    for c in range(nnum_next):
-        pkey = (int(cb[c]), int(child_parent_x[c]),
-                int(child_parent_y[c]), int(child_parent_z[c]))
-        if pkey in parent_lookup:
-            p = parent_lookup[pkey]
-            labels[p, int(octant[c])] = 1.0
+    # 父节点键: (batch_id, x, y, z) → 1D integer
+    p_key = (((pb.long() * S + px.long()) * S + py.long()) * S + pz.long())
+
+    # 子节点键: (batch_id, x//2, y//2, z//2) → 对应父节点键
+    c_key = (((cb.long() * S + child_parent_x.long()) * S
+              + child_parent_y.long()) * S + child_parent_z.long())
+
+    # 排序父键 → searchsorted 匹配
+    p_sorted, p_idx = p_key.sort()          # (nnum_d,)
+    c_sorted, c_idx = c_key.sort()           # (nnum_next,)
+
+    insert = torch.searchsorted(p_sorted, c_sorted)  # (nnum_next,)
+    valid = (insert < nnum_d)
+
+    if valid.any():
+        # 只处理位置合法的项
+        v_child_sorted = c_sorted[valid]
+        v_insert = insert[valid]
+        match = (p_sorted[v_insert] == v_child_sorted)  # (num_valid,)
+
+        if match.any():
+            # 映射回原始索引
+            orig_child = c_idx[valid][match]
+            orig_parent = p_idx[v_insert[match]]
+            labels[orig_parent, octant[orig_child].long()] = 1.0
 
     return labels
 
