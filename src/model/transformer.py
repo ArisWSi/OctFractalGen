@@ -167,16 +167,29 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     参数:
         x: (B, seq_len, n_head, head_dim)
-        freqs_cis: (seq_len, head_dim // 2, 2) — 每位置的 [cos, sin]
+        freqs_cis: (total_positions, head_dim // 2, 2) — 每位置的 [cos, sin]
+                   total_positions = seq_len 或 B * seq_len。
+                   B * seq_len 用于八叉树（每个 batch 项的节点位置不同）。
 
     返回:
         施加 RoPE 后的 x，形状不变
     """
     B, seq_len, n_head, head_dim = x.shape
-    # 将 x 重塑为复数对
+    total_positions = freqs_cis.shape[0]
+
     xshaped = x.float().reshape(B, seq_len, n_head, head_dim // 2, 2)
-    # 重塑 freqs_cis 以进行广播
-    freqs_cis = freqs_cis.view(1, seq_len, 1, head_dim // 2, 2)
+
+    if total_positions == seq_len:
+        # 所有 batch 项共享相同位置（如 2D 网格）
+        freqs_cis = freqs_cis.view(1, seq_len, 1, head_dim // 2, 2)
+    elif total_positions == B * seq_len:
+        # 每个 batch 项有独立位置（八叉树）
+        freqs_cis = freqs_cis.view(B, seq_len, head_dim // 2, 2)
+        freqs_cis = freqs_cis.unsqueeze(2)  # (B, seq_len, 1, head_dim//2, 2)
+    else:
+        raise ValueError(
+            f"freqs_cis has {total_positions} positions but x has "
+            f"B={B}, seq_len={seq_len}")
 
     # 施加旋转: (a+bi) * (cos θ + i sin θ)
     x_out2 = torch.stack([

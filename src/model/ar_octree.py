@@ -214,13 +214,12 @@ class OctreeAR(nn.Module):
             xyz: (B, seq_len, 3) 节点坐标
 
         返回:
-            freqs_cis: (B, seq_len, head_dim//2, 2)
+            freqs_cis: (B*seq_len, head_dim//2, 2) — 每位置独立编码
         """
         B, seq_len, _ = xyz.shape
         flat_xyz = xyz.reshape(B * seq_len, 3)
         head_dim = self.embed_dim // self.num_heads
-        freqs_cis = precompute_freqs_cis_3d(flat_xyz, head_dim)
-        return freqs_cis.view(B, seq_len, head_dim // 2, 2)
+        return precompute_freqs_cis_3d(flat_xyz, head_dim)
 
     # ------------------------------------------------------------------
     # Transformer 前向
