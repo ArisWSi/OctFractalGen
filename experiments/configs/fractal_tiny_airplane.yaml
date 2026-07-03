@@ -1,20 +1,27 @@
 # OctFractalGen — Tiny model, Airplane category
 # First-pass experiment: validate the recursive multi-model pipeline.
 #
+# Architecture:
+#   Level 0: AR at depth 3 (children at depth 4), 256 dim, 8 blocks
+#   Level 1: AR at depth 4 (children at depth 5), 128 dim, 4 blocks
+#   Terminal: VQHead at depth_stop=5 → BSQ code prediction
+#
 # Usage:
 #   python -m src.train --config experiments/configs/fractal_tiny_airplane.yaml
 #   python -m src.evaluate --checkpoint logs/fractal_tiny_airplane/best.pt ...
 
 experiment:
   name: fractal_tiny_airplane
-  description: "Tiny recursive AR octree model on ShapeNet airplane, VQ-VAE pipeline"
+  description: "Tiny recursive AR octree model (2 AR levels + VQHead) on ShapeNet airplane"
 
 model:
   full_depth: 3
   depth_stop: 5
+  # fractal_levels: depths where AR generators predict splits
+  # VQHead is an extra terminal level at depth_stop (not listed here)
   fractal_levels: [3, 4]
 
-  # Per-level capacity (coarse → fine, decreasing)
+  # Per-AR-level capacity (must match len(fractal_levels))
   embed_dims: [256, 128]
   num_blocks: [8, 4]
   num_heads: [4, 4]
@@ -30,7 +37,7 @@ model:
   num_classes: 1
   label_drop_prob: 0.1
 
-  # Spatial conditioning (not yet wired — direction 4)
+  # Spatial conditioning (not yet wired — Direction 4)
   num_spatial_neighbors: 7
   cond_embed_dim: 256
 
@@ -50,15 +57,14 @@ vqvae:
 data:
   location: "/root/autodl-tmp/ShapeNet/processed"
   filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
-  depth: 6
+  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
+  depth: 8                  # Must match VQ-VAE's vae_depth
   full_depth: 3
   points_scale: 1.0
   batch_size: 8
   num_workers: 4
   max_points: 120000
   distort: false
-  # Validation
-  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
 
 train:
   lr: 1.0e-4

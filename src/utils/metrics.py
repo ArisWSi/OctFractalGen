@@ -36,7 +36,9 @@ from tqdm import tqdm
 def dist_chamfer(x: torch.Tensor, y: torch.Tensor):
     """Batched Chamfer distance between two point clouds.
 
-    Adapted from AtlasNet / OctGPT implementation.
+    Adapted from AtlasNet / OctGPT implementation. Uses the standard
+    expansion ||x_i - y_j||^2 = ||x_i||^2 + ||y_j||^2 - 2<x_i, y_j>
+    which handles arbitrary point counts (N != M).
 
     Args:
         x: (B, N, D) first point cloud batch
@@ -49,22 +51,21 @@ def dist_chamfer(x: torch.Tensor, y: torch.Tensor):
     B, N, D = x.shape
     M = y.shape[1]
 
-    # Compute pairwise distances via expand + broadcast
-    xx = torch.bmm(x, x.transpose(2, 1))        # (B, N, N)
-    yy = torch.bmm(y, y.transpose(2, 1))        # (B, M, M)
-    zz = torch.bmm(x, y.transpose(2, 1))        # (B, N, M)
+    # Squared norms: (B, N, 1) and (B, M, 1)
+    x_norm = (x ** 2).sum(dim=-1, keepdim=True)
+    y_norm = (y ** 2).sum(dim=-1, keepdim=True)
 
-    # Extract diagonal for ||x_i||^2 and ||y_j||^2 terms
-    diag_x = torch.arange(0, N, device=x.device).long()
-    diag_y = torch.arange(0, M, device=y.device).long()
-    rx = xx[:, diag_x, diag_x].unsqueeze(1).expand_as(xx)   # (B, N, N)
-    ry = yy[:, diag_y, diag_y].unsqueeze(1).expand_as(yy)   # (B, M, M)
+    # Cross term: (B, N, M)
+    cross = torch.bmm(x, y.transpose(1, 2))
 
-    # ||x_i - y_j||^2 = ||x_i||^2 + ||y_j||^2 - 2<x_i, y_j>
-    P = rx.transpose(2, 1) + ry - 2 * zz                    # (B, N, M)
+    # Pairwise squared distances: ||x_i - y_j||^2
+    dist = x_norm + y_norm.transpose(1, 2) - 2 * cross  # (B, N, M)
 
-    dist_left = P.min(dim=2)[0]    # (B, N) — nearest y for each x
-    dist_right = P.min(dim=1)[0]   # (B, M) — nearest x for each y
+    # Clamp to avoid tiny negatives from floating point
+    dist = torch.clamp(dist, min=0.0)
+
+    dist_left = dist.min(dim=2)[0]    # (B, N) — nearest y for each x
+    dist_right = dist.min(dim=1)[0]   # (B, M) — nearest x for each y
 
     return dist_left, dist_right
 
@@ -274,11 +275,12 @@ def compute_cov_mmd(
 
     results = {}
     res_cd = _lgan_mmd_cov(M_rs_cd.t())
-    results.update({f"COV-CD" if 'cov' in k else f"MMD-CD": v
-                    for k, v in res_cd.items() if 'mmd' in k.lower() or 'cov' in k.lower()})
+    results['COV-CD'] = res_cd.get('lgan_cov', 0.0)
+    results['MMD-CD'] = res_cd.get('lgan_mmd', 0.0)
+
     res_emd = _lgan_mmd_cov(M_rs_emd.t())
-    results.update({f"COV-EMD" if 'cov' in k else f"MMD-EMD": v
-                    for k, v in res_emd.items() if 'mmd' in k.lower() or 'cov' in k.lower()})
+    results['COV-EMD'] = res_emd.get('lgan_cov', 0.0)
+    results['MMD-EMD'] = res_emd.get('lgan_mmd', 0.0)
 
     return results
 

@@ -28,7 +28,7 @@ from tqdm import tqdm
 # 将项目根目录加入路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import Config, ModelConfig, DataConfig, TrainConfig
+from src.config import Config, ModelConfig, VQVAEConfig, DataConfig, TrainConfig
 from src.config import (
     octree_fractal_tiny,
     octree_fractal_base,

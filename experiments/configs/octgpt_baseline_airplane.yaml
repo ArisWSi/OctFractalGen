@@ -1,20 +1,29 @@
 # OctGPT Baseline — Airplane, unconditional
 # Reference config matching OctGPT's shapenet_uncond.yaml for fair comparison.
 #
-# This is NOT used for training OctGPT (use its own main_octgpt.py);
-# it serves as a documented reference of the baseline configuration
-# that OctFractalGen is compared against.
-
-# OctGPT paper baseline (from extern/octgpt/configs/ShapeNet/shapenet_uncond.yaml)
+# This documents the baseline configuration that OctFractalGen is compared
+# against. OctGPT uses a single OctFormer processing all depths simultaneously,
+# while OctFractalGen uses per-level AR generators recursively.
+#
+# Key difference: OctGPT's depth_stop=6 (3 split operations) vs our default
+# depth_stop=5 (2 AR levels). For a fair A/B comparison at depth_stop=6,
+# use a 3-level OctFractalGen config (fractal_levels=[3,4,5]).
 
 baseline:
   model: OctGPT
-  total_params: "~150M (estimated: OctFormer 768dim, 24 blocks, 8 heads)"
+  description: "Single OctFormer with teacher-forcing cross-depth attention"
+  total_params: "~150M (OctFormer: 768 dim, 24 blocks, 8 heads)"
 
   octree:
-    depth: 8
+    depth: 8             # VQ-VAE full depth
     full_depth: 3
-    depth_stop: 6
+    depth_stop: 6        # Generate from depth 3 to depth 6
+
+  # OctGPT generates splits at depths 3, 4, 5 (creating nodes at 4, 5, 6)
+  # then predicts VQ codes at depth 6.
+  # Equivalent OctFractalGen config would be:
+  #   fractal_levels: [3, 4, 5], depth_stop: 6
+  #   embed_dims: [512, 384, 256], num_blocks: [16, 12, 8]
 
   octformer:
     num_embed: 768
@@ -32,25 +41,27 @@ baseline:
     max_epoch: 400
     lr: 1.0e-4
     weight_decay: 0.01
-    batch_size: 1  # ocnn internal batching
+    batch_size: 1        # ocnn internal batching (multiple shapes per octree)
     use_amp: true
-    mask_ratio_min: 0.5
-    num_iters: [64, 128, 128, 256]  # per depth
+    mask_ratio_min: 0.5  # Masked prediction (not causal AR)
+    num_iters: [64, 128, 128, 256]  # Per depth iteration count
 
   vqvae:
     model: vqvae_large
     embedding_channels: 32
     quantizer_type: bsq
     ckpt: saved_ckpt/vqvae_huge_im5_bsq32_200epoch.pth
+    vae_depth: 8
 
   data:
     location: "data/ShapeNet/dataset_256"
     filelist_train: "data/ShapeNet/filelist/train_airplane.txt"
     filelist_test: "data/ShapeNet/filelist/test_airplane.txt"
     samples: 2831
+    depth: 8
 
-  metrics:
-    1-NNA-CD-acc: "TBD (target: ~50%)"
-    COV-CD: "TBD"
+  # Expected metrics (from OctGPT paper / to be reproduced)
+  metrics_target:
+    1-NNA-CD-acc: "~50% (50% = indistinguishable)"
+    COV-CD: "~50%+"
     MMD-CD: "TBD"
-    generation_speed: "TBD (seconds per shape)"

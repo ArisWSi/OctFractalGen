@@ -1,15 +1,16 @@
 """
 OctreeFractalGen: 递归多模型八叉树生成器。
 
-从 FractalGen 的递归架构适配到 3D 八叉树。每层独立处理
-一个深度转换。递归结构提供:
-  - 层级化模型容量（粗→细递减参数量）
-  - 每层独立的自回归生成
-  - 最终层通过 VQ-VAE 解码几何
+从 FractalGen 的递归架构适配到 3D 八叉树。每层 AR generator
+独立处理一个深度转换的 split 预测。终端 VQHead 预测 BSQ 几何编码。
 
-架构（2层，full_depth=3, depth_stop=5）:
-  Level 0（深度 3→4）: OctreeAR Transformer → split 预测
-  Level 1（深度 4→5）: VQHead → BSQ 编码预测 → VQ-VAE 解码
+架构（fractal_levels=(3,4), depth_stop=5）:
+  Level 0（深度 3）: OctreeAR → split → 子节点在深度 4
+  Level 1（深度 4）: OctreeAR → split → 子节点在深度 5
+  Level 2（终端）:    VQHead @ depth_stop=5 → BSQ 编码 → VQ-VAE 解码
+
+fractal_levels 仅列出 AR generator 的深度；VQHead 是递归终止时的
+额外终端层，始终在 depth_stop 处操作。
 """
 
 from typing import Optional, Tuple
@@ -150,6 +151,11 @@ class OctreeFractalGen(nn.Module):
     最终层使用 VQHead 预测 BSQ 几何编码，由冻结的预训练
     VQ-VAE 解码为 mesh。
 
+    层级结构:
+      fractal_levels = (3, 4, 5)  → 3 个 AR generator，在 depth 3, 4, 5 做 split
+      depth_stop = 6              → 在第 0..2 层 AR 之后，终端 VQHead 在 depth 6
+      递归: Level 0→1→2→Terminal(VQHead @ depth_stop)
+
     参数:
         config: ModelConfig
         vqvae_wrapper: VQVAEWrapper（冻结的 VQ-VAE，用于编码/解码）
@@ -160,17 +166,22 @@ class OctreeFractalGen(nn.Module):
         super().__init__()
         self.config = config
         self.fractal_level = fractal_level
-        self.num_levels = len(config.fractal_levels)
-        self.current_depth = config.fractal_levels[fractal_level]
+        self.num_ar_levels = len(config.fractal_levels)
+        self.is_terminal = (fractal_level >= self.num_ar_levels)
+        self.is_ar = not self.is_terminal
         self.vqvae_wrapper = vqvae_wrapper
+
+        # current_depth: AR 层用 fractal_levels，终端用 depth_stop
+        if self.is_ar:
+            self.current_depth = config.fractal_levels[fractal_level]
+        else:
+            self.current_depth = config.depth_stop
 
         # ------------------------------------------------------------------
         # 类别嵌入（仅顶层）
         # ------------------------------------------------------------------
         if fractal_level == 0:
             self.num_classes = config.num_classes
-            # 遵循 FractalGen: embedding 大小 = num_classes（不含额外槽位，
-            # CFG 的假类别通过单独的 fake_latent 参数处理）
             self.class_emb = nn.Embedding(
                 config.num_classes, config.cond_embed_dim,
             )
@@ -180,31 +191,31 @@ class OctreeFractalGen(nn.Module):
             nn.init.normal_(self.fake_latent, std=0.02)
 
         # ------------------------------------------------------------------
-        # 当前层生成器
+        # 当前层生成器（仅 AR 层）
         # ------------------------------------------------------------------
-        is_final = (fractal_level == self.num_levels - 1)
-
-        if not is_final:
+        if self.is_ar:
+            idx = fractal_level  # index into per-level capacity arrays
             self.generator = OctreeAR(
-                embed_dim=config.embed_dims[fractal_level],
-                num_blocks=config.num_blocks[fractal_level],
-                num_heads=config.num_heads[fractal_level],
+                embed_dim=config.embed_dims[idx],
+                num_blocks=config.num_blocks[idx],
+                num_heads=config.num_heads[idx],
                 cond_dim_in=config.cond_embed_dim,
                 cond_dim_out=config.cond_embed_dim,
                 attn_drop=config.attn_drop,
                 proj_drop=config.proj_drop,
                 grad_checkpointing=config.grad_checkpointing,
             )
+        else:
+            self.generator = None
 
         # ------------------------------------------------------------------
-        # 下一层（递归或终止 VQHead）
+        # 下一层（递归 AR 或终止 VQHead）
         # ------------------------------------------------------------------
-        if not is_final:
+        if self.is_ar:
             self.next_fractal = OctreeFractalGen(
                 config, vqvae_wrapper, fractal_level + 1,
             )
         else:
-            # 从 VQ-VAE wrapper 获取 vq_groups（而非硬编码）
             vq_groups = 64
             if vqvae_wrapper is not None:
                 vq_groups = vqvae_wrapper.get_vq_config()['vq_groups']
@@ -262,47 +273,36 @@ class OctreeFractalGen(nn.Module):
     def _forward_level(self, octree, global_cond) -> torch.Tensor:
         """通过一个递归层级做前向传播。
 
-        中间层: AR split 预测（8-way 占用率的 BCE）。
-        最终层: VQ 编码预测（BSQ indices 的交叉熵）。
+        AR 层: 预测 split（8-way 占用率的 BCE）。
+        终端层: 预测 VQ 编码（BSQ indices 的交叉熵）。
         """
-        depth = self.config.fractal_levels[self.fractal_level]
         B = octree.batch_size
         device = octree.device
 
-        parent_xyz, _ = get_node_xyz(octree, depth)
-        nnum = octree.nnum[depth]
-        if nnum == 0:
-            return torch.tensor(0.0, device=device)
+        if self.is_ar:
+            # --- AR 层: split 预测 ---
+            depth = self.current_depth
+            parent_xyz, _ = get_node_xyz(octree, depth)
+            nnum = octree.nnum[depth]
+            if nnum == 0:
+                return torch.tensor(0.0, device=device)
 
-        Np = nnum // B
-        parent_xyz_3d = parent_xyz.view(B, Np, 3)
-        parent_cond = self._make_per_node_cond(global_cond, nnum, B)
+            Np = nnum // B
+            parent_xyz_3d = parent_xyz.view(B, Np, 3)
+            parent_cond = self._make_per_node_cond(global_cond, nnum, B)
 
-        is_final = (self.fractal_level == self.num_levels - 1)
-
-        if not is_final:
-            # --- 中间 AR 层: split 预测 ---
             gt_labels = get_split_labels(octree, depth).view(B, Np, 8)
             _, _, level_loss = self.generator(
                 parent_xyz_3d, parent_cond, gt_labels)
 
-            deeper_loss = torch.tensor(0.0, device=device)
-            if isinstance(self.next_fractal, OctreeFractalGen):
-                deeper_loss = self.next_fractal._forward_level(
-                    octree, global_cond)
+            deeper_loss = self.next_fractal._forward_level(octree, global_cond)
             return level_loss + deeper_loss
 
         else:
-            # --- 最终 VQHead 层: VQ 编码预测 ---
+            # --- 终端 VQHead 层: VQ 编码预测 ---
             if self.vqvae_wrapper is None:
-                raise RuntimeError(
-                    "最终层训练需要 vqvae_wrapper")
+                raise RuntimeError("终端层训练需要 vqvae_wrapper")
 
-            # 从八叉树提取 ground-truth VQ targets
-            vq_targets = self.vqvae_wrapper.extract_targets(octree)
-            # vq_targets: (nnum_at_depth_stop, vq_groups)
-
-            # 获取最终深度的叶子节点坐标
             final_depth = self.config.depth_stop
             leaf_xyz, _ = get_node_xyz(octree, final_depth)
             nnum_leaf = octree.nnum[final_depth]
@@ -311,11 +311,9 @@ class OctreeFractalGen(nn.Module):
 
             Np_final = nnum_leaf // B
             leaf_xyz_3d = leaf_xyz.view(B, Np_final, 3)
-
-            # 为叶子节点构建每节点条件
             leaf_cond = self._make_per_node_cond(global_cond, nnum_leaf, B)
 
-            # VQHead 前向
+            vq_targets = self.vqvae_wrapper.extract_targets(octree)
             _, level_loss = self.next_fractal(
                 leaf_xyz_3d, leaf_cond, vq_targets)
 
@@ -350,56 +348,51 @@ class OctreeFractalGen(nn.Module):
     @torch.no_grad()
     def _generate_level(self, octree, global_cond, temperature,
                         cfg_scale, uncond=None):
-        """生成一个八叉树深度并递归。"""
-        depth = self.config.fractal_levels[self.fractal_level]
+        """生成一个八叉树深度并递归。
+
+        AR 层: 采样 split → 展开八叉树 → 递归。
+        终端层: 在 depth_stop 处采样 VQ 编码。
+        """
         B = octree.batch_size
-        device = octree.device
 
-        parent_xyz, _ = get_node_xyz(octree, depth)
-        nnum = octree.nnum[depth]
-        if nnum == 0:
-            return octree, None
+        if self.is_ar:
+            # --- AR 层: 采样 split, 展开八叉树 ---
+            depth = self.current_depth
+            parent_xyz, _ = get_node_xyz(octree, depth)
+            nnum = octree.nnum[depth]
+            if nnum == 0:
+                return octree, None
 
-        Np = nnum // B
-        parent_xyz_3d = parent_xyz.view(B, Np, 3)
-        parent_cond = self._make_per_node_cond(global_cond, nnum, B)
+            Np = nnum // B
+            parent_xyz_3d = parent_xyz.view(B, Np, 3)
+            parent_cond = self._make_per_node_cond(global_cond, nnum, B)
 
-        is_final = (self.fractal_level == self.num_levels - 1)
-
-        if not is_final:
-            # --- 中间层: 采样 split, 展开八叉树 ---
             child_8way, _ = self.generator.sample(
                 parent_xyz_3d, parent_cond, temperature,
             )
-            # 将 8-way 预测折叠为二值 split:
-            # 任一子节点被占据 → 分裂父节点（创建全部 8 个子节点）
+            # 任一子节点被占据 → 分裂父节点
             split_label = child_8way.any(dim=-1).long().reshape(B * Np)
             octree.octree_split(split_label, depth=depth)
             octree.octree_grow(depth + 1)
 
-            if isinstance(self.next_fractal, OctreeFractalGen):
-                return self.next_fractal._generate_level(
-                    octree, global_cond, temperature, cfg_scale, uncond,
-                )
-            else:
-                # 下一个是 VQHead → 获取叶子节点并采样 VQ 编码
-                final_depth = self.config.depth_stop
-                leaf_xyz, _ = get_node_xyz(octree, final_depth)
-                nnum_leaf = octree.nnum[final_depth]
-                Np_leaf = nnum_leaf // B
-                leaf_xyz_3d = leaf_xyz.view(B, Np_leaf, 3)
-                leaf_cond = self._make_per_node_cond(
-                    global_cond, nnum_leaf, B)
-
-                vq_indices = self.next_fractal.sample(
-                    leaf_xyz_3d, leaf_cond, temperature,
-                )
-                return octree, vq_indices
+            return self.next_fractal._generate_level(
+                octree, global_cond, temperature, cfg_scale, uncond,
+            )
 
         else:
-            # VQHead 层: 直接采样 VQ 编码
+            # --- 终端层: 在 depth_stop 处采样 VQ 编码 ---
+            final_depth = self.config.depth_stop
+            leaf_xyz, _ = get_node_xyz(octree, final_depth)
+            nnum_leaf = octree.nnum[final_depth]
+            if nnum_leaf == 0:
+                return octree, None
+
+            Np_leaf = nnum_leaf // B
+            leaf_xyz_3d = leaf_xyz.view(B, Np_leaf, 3)
+            leaf_cond = self._make_per_node_cond(global_cond, nnum_leaf, B)
+
             vq_indices = self.next_fractal.sample(
-                parent_xyz_3d, parent_cond, temperature,
+                leaf_xyz_3d, leaf_cond, temperature,
             )
             return octree, vq_indices
 

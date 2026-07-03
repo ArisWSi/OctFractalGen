@@ -9,10 +9,12 @@ class ModelConfig:
     """OctreeFractalGen 的架构超参数。"""
 
     # 八叉树结构
-    full_depth: int = 3          # 初始八叉树深度（深度 3 有 8 个节点）
-    depth_stop: int = 5          # 最终生成深度
-    # fractal_levels: 每递归层的起始深度
-    # 例如 (3, 4) 表示 level 0 处理深度 3→4, level 1 处理深度 4→5
+    full_depth: int = 3          # 初始八叉树深度
+    depth_stop: int = 5          # VQHead 预测 VQ codes 的最终深度
+    # fractal_levels: AR generator 所在的深度列表
+    # 例如 (3, 4) 表示 depth 3 和 4 各一个 AR generator
+    # VQHead 在 depth_stop 作为额外的终端层（不计入此列表）
+    # 约束: depth_stop == fractal_levels[-1] + 1
     fractal_levels: Tuple[int, ...] = (3, 4)
 
     # 每层容量（索引 0 = 最粗，向最细递减）
@@ -67,7 +69,7 @@ class DataConfig:
     val_filelist: str = ""            # 验证集文件列表（空则跳过验证）
 
     # 八叉树构建
-    depth: int = 6                  # 最大八叉树深度
+    depth: int = 8                  # 最大八叉树深度（需 ≥ VQVAE 的 vae_depth）
     full_depth: int = 3             # 初始深度（与 ModelConfig 匹配）
     points_scale: float = 1.0       # 输入点云在 [-1, 1] 范围内
 
