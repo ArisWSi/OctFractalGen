@@ -445,16 +445,19 @@ class PatchAttention(nn.Module):
         self.patch_size = patch_size
         self.dilation = dilation
 
-        self.wqkv = nn.Linear(dim, dim * 3, bias=False)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
         self.attn_dropout_p = attn_drop
         self.resid_dropout = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Patch-wise 注意力前向。
+    def forward(self, x: torch.Tensor, xyz: torch.Tensor = None) -> torch.Tensor:
+        """Patch-wise 注意力 + 3D RoPE。
 
         参数:
             x: (B, N, C)
+            xyz: (B, N, 3) 节点坐标（用于 RoPE）
 
         返回:
             (B, N, C)
@@ -466,19 +469,32 @@ class PatchAttention(nn.Module):
         hd = self.head_dim
 
         # QKV 投影
-        qkv = self.wqkv(x)                    # (B, N, 3*C)
+        xq = self.wq(x)  # (B, N, C)
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        # 施加 3D RoPE（与 OctGPT 一致：patch partition 之前）
+        if xyz is not None:
+            flat_xyz = xyz.reshape(B * N, 3)
+            freqs_cis = precompute_freqs_cis_3d(flat_xyz, hd)  # (B*N, hd//2, 2)
+            xq = xq.view(B, N, H, hd)
+            xk = xk.view(B, N, H, hd)
+            xq = apply_rotary_emb(xq, freqs_cis)
+            xk = apply_rotary_emb(xk, freqs_cis)
+            xq = xq.view(B, N, C)
+            xk = xk.view(B, N, C)
+
+        # 合并 QKV
+        qkv = torch.cat([xq, xk, xv], dim=-1)  # (B, N, 3*C)
 
         # Partition + dilation
         qkv = patch_partition(qkv, K)         # (B, P, K, 3*C)
 
         if D > 1:
-            # Dilation: 重塑并转置以在 patch 间连接
-            # (B, P, K, 3C) → (B, K, P//D, D, 3C) → (B, P//D, K, D, 3C) → (B, P//D*K, 3C) → (B, P_new, K, 3C)
             P = qkv.shape[1]
             if P % D == 0:
                 qkv = qkv.view(B, P // D, D, K, -1)
                 qkv = qkv.transpose(2, 3).reshape(B, -1, K, 3 * C)
-            # 如果不能被 D 整除则跳过 dilation
 
         P = qkv.shape[1]
         # (B, P, K, 3C) → (B, P, K, 3, H, hd) → (3, B, P, H, K, hd)
@@ -495,16 +511,14 @@ class PatchAttention(nn.Module):
             q, k, v,
             attn_mask=None,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
-            is_causal=False,  # 双向（同深度 token）
+            is_causal=False,
         )
         y = y.view(B, P, H, K, hd)
         y = y.permute(0, 1, 3, 2, 4).reshape(B, P, K, C)  # (B, P, K, C)
 
         # 逆 dilation
         if D > 1 and y.shape[1] != N // K + (1 if N % K else 0):
-            Q = y.shape[1]
             orig_P = N // K + (1 if N % K else 0)
-            # 回退: (B, Q, K, C) → 恢复原始 patch 数
             y = y.view(B, -1, D, K, C)
             y = y.transpose(2, 3).reshape(B, orig_P, K, C)
 
@@ -547,7 +561,7 @@ class PatchTransformerBlock(nn.Module):
         self.feed_forward = FeedForward(dim, dropout=mlp_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path(self.attention(self.attn_norm(x)))
+    def forward(self, x: torch.Tensor, xyz: torch.Tensor = None) -> torch.Tensor:
+        x = x + self.drop_path(self.attention(self.attn_norm(x), xyz))
         x = x + self.drop_path(self.feed_forward(self.ffn_norm(x)))
         return x

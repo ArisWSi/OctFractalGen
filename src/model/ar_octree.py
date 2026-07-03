@@ -191,14 +191,15 @@ class OctreeAR(nn.Module):
     # Transformer 前向
     # ------------------------------------------------------------------
 
-    def _forward_transformer(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_transformer(self, x: torch.Tensor,
+                             xyz: torch.Tensor = None) -> torch.Tensor:
         """通过所有 patch attention block 做前向传播。"""
         if self.grad_checkpointing and self.training:
             for block in self.blocks:
-                x = checkpoint(block, x, use_reentrant=False)
+                x = checkpoint(block, x, xyz, use_reentrant=False)
         else:
             for block in self.blocks:
-                x = block(x)
+                x = block(x, xyz)
         return self.norm(x)
 
     # ------------------------------------------------------------------
@@ -232,8 +233,8 @@ class OctreeAR(nn.Module):
             self._build_child_tokens_morton(parent_xyz, parent_cond))
         # child_tokens: (B, Np*8, embed_dim)
 
-        # Patch attention 前向
-        x = self._forward_transformer(child_tokens)     # (B, Np*8, embed_dim)
+        # Patch attention 前向（带 3D RoPE 坐标）
+        x = self._forward_transformer(child_tokens, child_xyz_m)
 
         # Split logits
         logits_morton = self.split_head(x).squeeze(-1)   # (B, Np*8)
@@ -277,10 +278,10 @@ class OctreeAR(nn.Module):
         """
         B, Np, _ = parent_xyz.shape
 
-        child_tokens, _, sort_idx, unsort_idx = (
+        child_tokens, child_xyz_m, sort_idx, unsort_idx = (
             self._build_child_tokens_morton(parent_xyz, parent_cond))
 
-        x = self._forward_transformer(child_tokens)
+        x = self._forward_transformer(child_tokens, child_xyz_m)
 
         # Split logits
         logits_m = self.split_head(x).squeeze(-1) / temperature  # (B, Np*8)
