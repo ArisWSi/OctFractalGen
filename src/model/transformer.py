@@ -119,44 +119,45 @@ def precompute_freqs_cis_3d(
 ) -> torch.Tensor:
     """为任意节点位置计算 3D RoPE 频率。
 
-    将 head 维度等分为 3 份，分别对应 x、y、z 轴。
-    每轴使用标准 RoPE 频率带编码位置。
+    将 head 的 dim//2 个频率对分配到 x、y、z 三轴。
+    每轴独立生成 RoPE 频率带，拼接后总长 == dim//2。
 
     参数:
         xyz: (N, 3) float 张量，节点坐标在 [0, 2^depth) 范围内
-        dim: head 维度（dim // num_heads）
+        dim: head 维度（embed_dim // num_heads）
         base: RoPE 基频
 
     返回:
         freqs_cis: (N, dim // 2, 2) 复数表示 [cos, sin]
     """
-    N = xyz.shape[0]
-    third_dim = dim // 3
-    # 每三分之一内仅使用偶数频率
-    n_elem = (third_dim // 2) * 2
+    N, device = xyz.shape[0], xyz.device
+    dim_half = dim // 2
 
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2,
-                                         device=xyz.device).float() / n_elem))
+    # 将 dim_half 个频率对分配到 3 轴，余数优先分配给前几轴
+    # 例: dim=64 → dim_half=32 → x:11, y:11, z:10
+    base_per_axis = dim_half // 3
+    remainder = dim_half % 3
+    axis_sizes = [base_per_axis + (1 if i < remainder else 0) for i in range(3)]
 
-    # 每轴计算外积
-    freqs_x = torch.outer(xyz[:, 0], freqs)  # (N, n_elem // 2)
-    freqs_y = torch.outer(xyz[:, 1], freqs)
-    freqs_z = torch.outer(xyz[:, 2], freqs)
+    freqs_parts = []
+    for i, d in enumerate(axis_sizes):
+        if d == 0:
+            continue
+        # 每轴内仅使用偶数个频率元素
+        n_elem = (d // 2) * 2
+        if n_elem == 0:
+            freqs_parts.append(torch.zeros(N, d, device=device))
+            continue
+        freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2,
+                                             device=device).float() / n_elem))
+        f = torch.outer(xyz[:, i], freqs)               # (N, n_elem // 2)
+        # 补齐到 d
+        pad_len = d - f.shape[1]
+        if pad_len > 0:
+            f = torch.cat([f, torch.zeros(N, pad_len, device=device)], dim=1)
+        freqs_parts.append(f)
 
-    # 填充到 third_dim // 2（处理奇数维度）
-    pad_len = third_dim // 2 - freqs_x.shape[1]
-    if pad_len > 0:
-        freqs_x = torch.cat(
-            [freqs_x, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
-        freqs_y = torch.cat(
-            [freqs_y, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
-        freqs_z = torch.cat(
-            [freqs_z, torch.zeros(N, pad_len, device=xyz.device)], dim=1)
-
-    # 拼接: [freqs_x | freqs_y | freqs_z] → (N, dim // 2)
-    freqs_cat = torch.cat([freqs_x, freqs_y, freqs_z], dim=1)
-
-    # 转换为复数表示 [cos, sin]
+    freqs_cat = torch.cat(freqs_parts, dim=1)            # (N, dim // 2)
     freqs_cis = torch.stack([torch.cos(freqs_cat), torch.sin(freqs_cat)], dim=-1)
     return freqs_cis
 
