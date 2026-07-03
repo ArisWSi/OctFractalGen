@@ -38,8 +38,7 @@ def _load_vqvae(ckpt_path: str, device: torch.device,
     """
     import sys as _sys
     octgpt_root = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))),
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'extern', 'octgpt',
     )
     if octgpt_root not in _sys.path:
