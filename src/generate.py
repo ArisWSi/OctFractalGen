@@ -27,13 +27,14 @@ from src.utils.mesh import marching_cubes, save_mesh
 
 
 def _load_vqvae(ckpt_path: str, device: torch.device,
-                embedding_channels: int = 32):
-    """从 OctGPT checkpoint 加载 VQ-VAE。
+                embedding_channels: int = 32, vae_name: str = "vqvae_large"):
+    """从 OctGPT checkpoint 加载匹配架构的 VQ-VAE。
 
     参数:
         ckpt_path: VQ-VAE .pt checkpoint 路径
         device: torch 设备
         embedding_channels: BSQ 嵌入维度（需与 checkpoint 匹配）
+        vae_name: 模型变体名 ('vqvae_big' | 'vqvae_large' | 'vqvae_huge')
     """
     import sys as _sys
     octgpt_root = os.path.join(
@@ -43,9 +44,10 @@ def _load_vqvae(ckpt_path: str, device: torch.device,
     )
     if octgpt_root not in _sys.path:
         _sys.path.insert(0, octgpt_root)
-    from models.vae import VQVAE
+    from src.model.vqvae_wrapper import create_vqvae
 
-    vqvae = VQVAE(
+    vqvae = create_vqvae(
+        vae_name,
         in_channels=4,
         embedding_channels=embedding_channels,
         embedding_sizes=128,
@@ -92,8 +94,9 @@ def load_model(checkpoint_path: str, device: torch.device,
     if eff_path:
         print(f"从 {eff_path} 加载 VQ-VAE ...")
         embedding_channels = getattr(config.vqvae, 'embedding_channels', 32)
+        vae_name = getattr(config.vqvae, 'vae_name', 'vqvae_large')
         vae_depth = getattr(config.vqvae, 'vae_depth', 8)
-        vqvae = _load_vqvae(eff_path, device, embedding_channels)
+        vqvae = _load_vqvae(eff_path, device, embedding_channels, vae_name)
         vqvae_wrapper = VQVAEWrapper(
             vqvae, model_cfg.depth_stop, model_cfg.full_depth, vae_depth)
         print("VQ-VAE 已加载。")

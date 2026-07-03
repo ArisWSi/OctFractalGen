@@ -3,8 +3,11 @@
 #
 # Architecture:
 #   Level 0: AR at depth 3 (children at depth 4), 256 dim, 8 blocks
-#   Level 1: AR at depth 4 (children at depth 5), 128 dim, 4 blocks
-#   Terminal: VQHead at depth_stop=5 → BSQ code prediction
+#   Level 1: AR at depth 4 (children at depth 5), 192 dim, 6 blocks
+#   Level 2: AR at depth 5 (children at depth 6), 128 dim, 4 blocks
+#   Terminal: VQHead at depth_stop=6 → BSQ code prediction
+#
+# depth_stop=6 matches vqvae_large code_depth (vae_depth 8 - delta_depth 2).
 #
 # Usage:
 #   python -m src.train --config experiments/configs/fractal_tiny_airplane.yaml
@@ -12,19 +15,19 @@
 
 experiment:
   name: fractal_tiny_airplane
-  description: "Tiny recursive AR octree model (2 AR levels + VQHead) on ShapeNet airplane"
+  description: "Tiny recursive AR octree model (3 AR levels + VQHead) on ShapeNet airplane"
 
 model:
   full_depth: 3
-  depth_stop: 5
+  depth_stop: 6
   # fractal_levels: depths where AR generators predict splits
   # VQHead is an extra terminal level at depth_stop (not listed here)
-  fractal_levels: [3, 4]
+  fractal_levels: [3, 4, 5]
 
   # Per-AR-level capacity (must match len(fractal_levels))
-  embed_dims: [256, 128]
-  num_blocks: [8, 4]
-  num_heads: [4, 4]
+  embed_dims: [256, 192, 128]
+  num_blocks: [8, 6, 4]
+  num_heads: [4, 4, 4]
 
   # Shared transformer settings
   mlp_ratio: 4.0
@@ -44,6 +47,7 @@ model:
   grad_checkpointing: false
 
 vqvae:
+  vae_name: "vqvae_large"           # Must match the checkpoint architecture
   ckpt_path: "/root/autodl-tmp/OctGPT/vqvae_large_im5_uncond_bsq32.pth"
   embedding_channels: 32
   embedding_sizes: 128
@@ -52,13 +56,13 @@ vqvae:
   feature: "ND"
   in_channels: 4
   n_node_type: 7
-  vae_depth: 8
+  vae_depth: 8                      # code_depth = 8 - 2 = 6 = depth_stop
 
 data:
   location: "/root/autodl-tmp/ShapeNet/processed"
   filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
   val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
-  depth: 8                  # Must match VQ-VAE's vae_depth
+  depth: 8                          # Must match VQ-VAE vae_depth
   full_depth: 3
   points_scale: 1.0
   batch_size: 8

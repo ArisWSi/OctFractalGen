@@ -349,13 +349,14 @@ def process_category(
     return stats
 
 
-def _init_vqvae(vqvae_ckpt: str, depth_stop: int = 5, full_depth: int = 3):
+def _init_vqvae(vqvae_ckpt: str, depth_stop: int = 6, full_depth: int = 3,
+                vae_name: str = "vqvae_large"):
     """Initialize VQ-VAE wrapper for target pre-computation."""
     import torch
     sys.path.insert(0, os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'src'))
-    from src.model.vqvae_wrapper import VQVAEWrapper
+    from src.model.vqvae_wrapper import VQVAEWrapper, create_vqvae
 
     # Add octgpt to path for VQVAE import
     octgpt_root = os.path.join(
@@ -363,11 +364,11 @@ def _init_vqvae(vqvae_ckpt: str, depth_stop: int = 5, full_depth: int = 3):
         'extern', 'octgpt')
     if octgpt_root not in sys.path:
         sys.path.insert(0, octgpt_root)
-    from models.vae import VQVAE
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    vqvae = VQVAE(
+    vqvae = create_vqvae(
+        vae_name,
         in_channels=4,
         embedding_channels=32,
         embedding_sizes=128,

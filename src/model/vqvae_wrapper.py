@@ -8,6 +8,11 @@ OctGPT 预训练 VQ-VAE 的轻量封装。
   训练: octree → extract_code → quantize → BSQ indices（作为target）
   推理: 预测的 indices → extract_code → decode → Neural MPU → mesh
 
+VQ-VAE 变体（来自 OctGPT builder.py）:
+  vqvae_big:   enc=[32,32,64],     delta_depth=2, code_depth=6, ~8M
+  vqvae_large: enc=[32,32,64],     delta_depth=2, code_depth=6, ~34M
+  vqvae_huge:  enc=[32,64,128,256], delta_depth=3, code_depth=5, ~76M
+
 参数:
     vqvae: OctGPT 的 VQVAE nn.Module（预训练、冻结）
     depth_stop: VQ codes 所在的最终八叉树深度
@@ -16,11 +21,97 @@ OctGPT 预训练 VQ-VAE 的轻量封装。
 """
 
 import copy
-from typing import Tuple
+import os
+import sys
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+
+# ---------------------------------------------------------------------------
+# VQ-VAE 工厂函数 — 创建与 checkpoint 匹配的架构变体
+# ---------------------------------------------------------------------------
+
+# 缓存每个变体的 code_depth（vae_depth - delta_depth）
+_VQVAE_CODE_DEPTH = {
+    'vqvae_big': 6,
+    'vqvae_large': 6,
+    'vqvae_huge': 5,
+}
+
+
+def get_vqvae_code_depth(vae_name: str, vae_depth: int = 8) -> int:
+    """返回 VQ-VAE 变体在给定 octree depth 下的 code depth。
+
+    code_depth = vae_depth - delta_depth
+    用于验证/推导 depth_stop。
+    """
+    return _VQVAE_CODE_DEPTH.get(vae_name, vae_depth - 2)
+
+
+def create_vqvae(vae_name: str, **kwargs) -> nn.Module:
+    """创建与 OctGPT checkpoint 架构匹配的 VQ-VAE 实例。
+
+    复制 builder.py 中的 config_network 重写，避免依赖 thsolver flags。
+    每个变体重写 config_network() 设置 encoder/decoder 通道配置。
+
+    Args:
+        vae_name: 'vqvae_big' | 'vqvae_large' | 'vqvae_huge'
+        **kwargs: 传给 VQVAE.__init__（in_channels, embedding_channels, ...）
+
+    Returns:
+        正确架构的 VQVAE 实例
+    """
+    # 延迟导入以避免 extern/octgpt 路径问题（调用方负责设置 sys.path）
+    from models.vae import VQVAE
+
+    if vae_name == 'vqvae_big':
+        class _VQVAE(VQVAE):
+            def config_network(self):
+                self.bottleneck = 1
+                self.mpu_stage_nums = 3
+                self.pred_stage_nums = 3
+                self.enc_channels = [32, 32, 64]
+                self.enc_resblk_nums = [2, 2, 2]
+                self.dec_enc_channels = [32, 64, 128, 256]
+                self.dec_enc_resblk_nums = [2, 4, 4, 2]
+                self.dec_dec_channels = [256, 128, 64, 32, 32, 32]
+                self.dec_dec_resblk_nums = [2, 4, 4, 2, 2, 2]
+    elif vae_name == 'vqvae_large':
+        class _VQVAE(VQVAE):
+            def config_network(self):
+                self.bottleneck = 1
+                self.mpu_stage_nums = 3
+                self.pred_stage_nums = 3
+                self.enc_channels = [32, 32, 64]
+                self.enc_resblk_nums = [2, 2, 2]
+                self.dec_enc_channels = [64, 128, 256, 512]
+                self.dec_enc_resblk_nums = [2, 4, 8, 2]
+                self.dec_dec_channels = [512, 256, 128, 64, 32, 32]
+                self.dec_dec_resblk_nums = [2, 4, 8, 2, 2, 2]
+    elif vae_name == 'vqvae_huge':
+        class _VQVAE(VQVAE):
+            def config_network(self):
+                self.bottleneck = 1
+                self.mpu_stage_nums = 4
+                self.pred_stage_nums = 4
+                self.enc_channels = [32, 64, 128, 256]
+                self.enc_resblk_nums = [2, 2, 2, 2]
+                self.dec_enc_channels = [256, 256, 512, 1024]
+                self.dec_enc_resblk_nums = [2, 4, 4, 4]
+                self.dec_dec_channels = [1024, 512, 256, 256, 128, 64, 32]
+                self.dec_dec_resblk_nums = [4, 4, 4, 2, 2, 2, 2]
+    else:
+        # 回退到基础 VQVAE（默认 enc_channels=[32,32,64]）
+        return VQVAE(**kwargs)
+
+    return _VQVAE(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# VQVAEWrapper
+# ---------------------------------------------------------------------------
 
 class VQVAEWrapper:
     """对 OctGPT 预训练 VQ-VAE 的轻量封装。

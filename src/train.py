@@ -114,7 +114,7 @@ def cosine_scheduler(
 def _load_vqvae(vqvae_cfg, device: torch.device):
     """从 OctGPT checkpoint 加载预训练 VQ-VAE。
 
-    先尝试从 extern/octgpt 导入，使用 config 中的参数。
+    使用 create_vqvae 根据 vae_name 创建匹配 checkpoint 的架构变体。
     """
     import sys as _sys
     octgpt_root = os.path.join(
@@ -125,9 +125,11 @@ def _load_vqvae(vqvae_cfg, device: torch.device):
     if octgpt_root not in _sys.path:
         _sys.path.insert(0, octgpt_root)
 
-    from models.vae import VQVAE
+    from src.model.vqvae_wrapper import create_vqvae, get_vqvae_code_depth
 
-    vqvae = VQVAE(
+    vae_name = getattr(vqvae_cfg, 'vae_name', 'vqvae_large')
+    vqvae = create_vqvae(
+        vae_name,
         in_channels=vqvae_cfg.in_channels,
         embedding_channels=vqvae_cfg.embedding_channels,
         embedding_sizes=vqvae_cfg.embedding_sizes,
@@ -143,6 +145,10 @@ def _load_vqvae(vqvae_cfg, device: torch.device):
     vqvae.eval()
     for p in vqvae.parameters():
         p.requires_grad = False
+
+    expected_code_depth = get_vqvae_code_depth(vae_name, vqvae_cfg.vae_depth)
+    print(f"VQ-VAE ({vae_name}) 已加载，code_depth={expected_code_depth}。")
+
     return vqvae
 
 

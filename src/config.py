@@ -10,17 +10,17 @@ class ModelConfig:
 
     # 八叉树结构
     full_depth: int = 3          # 初始八叉树深度
-    depth_stop: int = 5          # VQHead 预测 VQ codes 的最终深度
+    depth_stop: int = 6          # VQHead 预测 VQ codes 的最终深度（= VQVAE code_depth）
     # fractal_levels: AR generator 所在的深度列表
-    # 例如 (3, 4) 表示 depth 3 和 4 各一个 AR generator
+    # 例如 (3, 4, 5) 表示 depth 3, 4, 5 各一个 AR generator
     # VQHead 在 depth_stop 作为额外的终端层（不计入此列表）
     # 约束: depth_stop == fractal_levels[-1] + 1
-    fractal_levels: Tuple[int, ...] = (3, 4)
+    fractal_levels: Tuple[int, ...] = (3, 4, 5)
 
     # 每层容量（索引 0 = 最粗，向最细递减）
-    embed_dims: Tuple[int, ...] = (512, 256)
-    num_blocks: Tuple[int, ...] = (16, 8)
-    num_heads: Tuple[int, ...] = (8, 4)
+    embed_dims: Tuple[int, ...] = (512, 384, 256)
+    num_blocks: Tuple[int, ...] = (16, 12, 8)
+    num_heads: Tuple[int, ...] = (8, 6, 4)
 
     # 共享 Transformer 设置
     mlp_ratio: float = 4.0
@@ -47,6 +47,9 @@ class VQVAEConfig:
 
     # 预训练 VQ-VAE checkpoint 路径
     ckpt_path: str = ""
+
+    # 模型变体（必须与 checkpoint 匹配，控制 encoder/decoder 架构）
+    vae_name: str = "vqvae_large"   # 'vqvae_big' | 'vqvae_large' | 'vqvae_huge'
 
     # VQ 架构（必须与 checkpoint 匹配）
     embedding_channels: int = 32     # 注意：OctGPT 默认用 32，非 64
@@ -122,11 +125,12 @@ class Config:
 # ------------------------------------------------------------------
 
 def octree_fractal_tiny(**overrides) -> Config:
-    """微型模型，用于快速迭代: 2 层，小容量。"""
+    """微型模型，用于快速迭代: 3 层 AR，小容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
-            embed_dims=(256, 128), num_blocks=(8, 4), num_heads=(4, 4),
+            full_depth=3, depth_stop=6, fractal_levels=(3, 4, 5),
+            embed_dims=(256, 192, 128), num_blocks=(8, 6, 4),
+            num_heads=(4, 4, 4),
             cond_embed_dim=256,
             **overrides,
         )
@@ -134,11 +138,12 @@ def octree_fractal_tiny(**overrides) -> Config:
 
 
 def octree_fractal_base(**overrides) -> Config:
-    """基础模型: 2 层，中等容量。"""
+    """基础模型: 3 层 AR，中等容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
-            embed_dims=(512, 256), num_blocks=(16, 8), num_heads=(8, 4),
+            full_depth=3, depth_stop=6, fractal_levels=(3, 4, 5),
+            embed_dims=(512, 384, 256), num_blocks=(16, 12, 8),
+            num_heads=(8, 6, 4),
             cond_embed_dim=512,
             **overrides,
         )
@@ -146,11 +151,12 @@ def octree_fractal_base(**overrides) -> Config:
 
 
 def octree_fractal_large(**overrides) -> Config:
-    """大型模型: 2 层，高容量。"""
+    """大型模型: 3 层 AR，高容量。"""
     return Config(
         model=ModelConfig(
-            full_depth=3, depth_stop=5, fractal_levels=(3, 4),
-            embed_dims=(768, 384), num_blocks=(24, 12), num_heads=(12, 6),
+            full_depth=3, depth_stop=6, fractal_levels=(3, 4, 5),
+            embed_dims=(768, 512, 384), num_blocks=(24, 16, 12),
+            num_heads=(12, 8, 6),
             cond_embed_dim=768,
             **overrides,
         )

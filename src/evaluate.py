@@ -46,8 +46,8 @@ from src.utils.metrics import (
 # ---------------------------------------------------------------------------
 
 def _load_vqvae(ckpt_path: str, device: torch.device,
-                embedding_channels: int = 32):
-    """Load VQ-VAE from OctGPT checkpoint."""
+                embedding_channels: int = 32, vae_name: str = "vqvae_large"):
+    """Load VQ-VAE from OctGPT checkpoint with correct architecture variant."""
     octgpt_root = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))),
@@ -55,9 +55,10 @@ def _load_vqvae(ckpt_path: str, device: torch.device,
     )
     if octgpt_root not in sys.path:
         sys.path.insert(0, octgpt_root)
-    from models.vae import VQVAE
+    from src.model.vqvae_wrapper import create_vqvae
 
-    vqvae = VQVAE(
+    vqvae = create_vqvae(
+        vae_name,
         in_channels=4,
         embedding_channels=embedding_channels,
         embedding_sizes=128,
@@ -97,8 +98,9 @@ def load_model(checkpoint_path: str, device: torch.device,
     if eff_path and os.path.exists(eff_path):
         print(f"Loading VQ-VAE from {eff_path} ...")
         embedding_channels = getattr(config.vqvae, 'embedding_channels', 32)
+        vae_name = getattr(config.vqvae, 'vae_name', 'vqvae_large')
         vae_depth = getattr(config.vqvae, 'vae_depth', 8)
-        vqvae = _load_vqvae(eff_path, device, embedding_channels)
+        vqvae = _load_vqvae(eff_path, device, embedding_channels, vae_name)
         vqvae_wrapper = VQVAEWrapper(
             vqvae, model_cfg.depth_stop, model_cfg.full_depth, vae_depth)
         print("VQ-VAE loaded.")
