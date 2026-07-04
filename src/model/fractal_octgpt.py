@@ -194,15 +194,8 @@ class FractalOctGPT(nn.Module):
             loss, cond_out, diag = self.layer(
                 octree, depth, global_cond, gt_split,
             )
-            # cond_out (nnum, dim) → mean pool 为 (B, dim) 作为下一层 cond
-            _, batch_ids = get_node_xyz(octree, depth)
-            next_cond = torch.zeros(B, cond_out.shape[-1],
-                                    device=device, dtype=cond_out.dtype)
-            for b in range(B):
-                mask_b = batch_ids == b
-                if mask_b.any():
-                    next_cond[b] = cond_out[mask_b].mean(0)
-            deeper = self.next_fractal._forward_level(octree, next_cond)
+            # cond_out 是 CLS token 输出 (B, dim)，直接传给下一层
+            deeper = self.next_fractal._forward_level(octree, cond_out)
             return loss + deeper
         else:
             vq_targets = self.vqvae_wrapper.extract_targets(octree)
@@ -258,16 +251,9 @@ class FractalOctGPT(nn.Module):
             )
             octree.octree_split(split_d, depth=depth)
             octree.octree_grow(depth + 1)
-            # cond_out (nnum, dim) → mean pool 为 (B, dim) 作为下一层 cond
-            _, batch_ids = get_node_xyz(octree, depth)
-            next_cond = torch.zeros(B, cond_out.shape[-1],
-                                    device=device, dtype=cond_out.dtype)
-            for b in range(B):
-                mask_b = batch_ids == b
-                if mask_b.any():
-                    next_cond[b] = cond_out[mask_b].mean(0)
+            # cond_out 是 CLS token 输出 (B, dim)，直接传给下一层
             return self.next_fractal._generate_level(
-                octree, next_cond, temperature, cfg_scale)
+                octree, cond_out, temperature, cfg_scale)
         else:
             vq_indices, cond_out = self.layer.sample(
                 octree, depth, global_cond,
