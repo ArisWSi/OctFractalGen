@@ -43,6 +43,22 @@ class ModelConfig:
     # 梯度检查点
     grad_checkpointing: bool = False
 
+    # ── FractalOctGPT 架构参数（复用 OctFormer）─────────────────
+    # 统一维度/头数（所有层共享，满足 RoPE 约束 head_dim % 6 == 0）
+    # OctGPT 原版: num_embed=768, num_heads=8 → head_dim=96, 96%6==0
+    octgpt_embed_dim: int = 768
+    octgpt_num_heads: int = 8
+    use_swin: bool = True              # SWIN 窗口移位
+    pos_emb_type: str = "sin"          # 'sin' | 'abs'（abs 对 num_embed%6≠0 有 bug）
+
+    # ── MaskGIT 生成参数（与 OctGPT 对齐）──────────────────────
+    buffer_size: int = 64           # 每层条件 buffer token 数（per batch item）
+    random_flip: float = 0.1        # BSQ bit 翻转增强（训练时）
+    remask_stage: float = 0.7       # 开始 remask 的进度比例
+    # 每 depth 的迭代次数和起始温度（fractal_levels + VQHead = 4 层）
+    num_iters: Tuple[int, ...] = (64, 128, 128, 256)
+    start_temperature: Tuple[float, ...] = (1.0, 1.2, 0.5, 0.5)
+
 
 @dataclass
 class VQVAEConfig:

@@ -1,0 +1,86 @@
+# OctFractalGen — Base model, Airplane category
+# Larger capacity than tiny for better quality, still 3 AR levels + VQHead.
+#
+# Architecture:
+#   Level 0: AR at depth 3, 512 dim, 16 blocks, 8 heads
+#   Level 1: AR at depth 4, 384 dim, 12 blocks, 6 heads
+#   Level 2: AR at depth 5, 256 dim, 8 blocks, 4 heads
+#   Terminal: VQHead at depth_stop=6 → BSQ code prediction
+#
+# depth_stop=6 matches vqvae_large code_depth (vae_depth 8 - delta_depth 2).
+#
+# Usage:
+#   python -m src.train --config experiments/configs/fractal_base_airplane_remote.yaml
+#   python -m src.evaluate --checkpoint logs/fractal_base_airplane_remote/best.pt ...
+
+experiment:
+  name: fractal_base_airplane_remote
+  description: "Base recursive AR octree model (3 AR levels + VQHead) on ShapeNet airplane"
+
+model:
+  full_depth: 3
+  depth_stop: 6
+  fractal_levels: [3, 4, 5]
+
+  # Per-AR-level capacity (must match len(fractal_levels))
+  embed_dims: [512, 384, 256]
+  num_blocks: [16, 12, 8]
+  num_heads: [8, 6, 4]
+
+  # Shared transformer settings
+  mlp_ratio: 4.0
+  attn_drop: 0.1
+  proj_drop: 0.1
+  drop_path: 0.0
+
+  # Patch attention (OctFormer-style)
+  patch_size: 256
+  dilation: 4
+
+  # Condition (unconditional for first run)
+  num_classes: 1
+  label_drop_prob: 0.1
+
+  # Spatial conditioning (not yet wired — Direction 4)
+  num_spatial_neighbors: 7
+  cond_embed_dim: 512
+
+  grad_checkpointing: false
+
+vqvae:
+  vae_name: "vqvae_large"
+  ckpt_path: "/root/autodl-tmp/OctGPT/vqvae_large_im5_uncond_bsq32.pth"
+  embedding_channels: 32
+  embedding_sizes: 128
+  quantizer_type: "bsq"
+  quantizer_group: 4
+  feature: "ND"
+  in_channels: 4
+  n_node_type: 7
+  vae_depth: 8
+
+data:
+  location: "/root/autodl-tmp/ShapeNet/processed"
+  filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
+  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
+  depth: 8
+  full_depth: 3
+  points_scale: 1.0
+  batch_size: 8
+  num_workers: 4
+  max_points: 120000
+  distort: false
+
+train:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 3.0
+  max_epoch: 200
+  warmup_epochs: 2
+  use_amp: true
+  log_interval: 50
+  save_interval: 20
+  logdir: "logs/fractal_base_airplane_remote"
+  device: "cuda"
+  seed: 42

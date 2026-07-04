@@ -452,12 +452,14 @@ class PatchAttention(nn.Module):
         self.attn_dropout_p = attn_drop
         self.resid_dropout = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, xyz: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                freqs_cis: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Patch-wise 注意力 + 3D RoPE。
 
         参数:
             x: (B, N, C)
-            xyz: (B, N, 3) 节点坐标（用于 RoPE）
+            freqs_cis: (B*N, hd//2, 2) 预计算的 RoPE 频率（由调用方一次性算好，
+                       避免每个 block 重复计算）
 
         返回:
             (B, N, C)
@@ -474,9 +476,7 @@ class PatchAttention(nn.Module):
         xv = self.wv(x)
 
         # 施加 3D RoPE（与 OctGPT 一致：patch partition 之前）
-        if xyz is not None:
-            flat_xyz = xyz.reshape(B * N, 3)
-            freqs_cis = precompute_freqs_cis_3d(flat_xyz, hd)  # (B*N, hd//2, 2)
+        if freqs_cis is not None:
             xq = xq.view(B, N, H, hd)
             xk = xk.view(B, N, H, hd)
             xq = apply_rotary_emb(xq, freqs_cis)
@@ -561,7 +561,8 @@ class PatchTransformerBlock(nn.Module):
         self.feed_forward = FeedForward(dim, dropout=mlp_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, xyz: torch.Tensor = None) -> torch.Tensor:
-        x = x + self.drop_path(self.attention(self.attn_norm(x), xyz))
+    def forward(self, x: torch.Tensor,
+                freqs_cis: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.drop_path(self.attention(self.attn_norm(x), freqs_cis))
         x = x + self.drop_path(self.feed_forward(self.ffn_norm(x)))
         return x

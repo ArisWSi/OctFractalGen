@@ -284,7 +284,7 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
     os.makedirs(logdir, exist_ok=True)
 
     checkpoint = {
-        'model': model.state_dict(),
+        'model': get_raw_model().state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
         'global_step': global_step,
@@ -440,6 +440,16 @@ def main():
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型参数量: {n_params:,}")
+
+    # 多卡并行（DataParallel）
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"使用 {n_gpus} 张 GPU 进行 DataParallel 训练")
+        model = torch.nn.DataParallel(model, device_ids=list(range(n_gpus)))
+        # 获取底层模型用于保存 checkpoint
+        get_raw_model = lambda: model.module
+    else:
+        get_raw_model = lambda: model
 
     # 数据加载
     from src.data.shapenet import get_shapenet_dataset

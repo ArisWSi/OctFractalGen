@@ -19,6 +19,9 @@ import torch
 import torch.nn as nn
 
 from src.model.ar_octree import OctreeAR
+from src.model.transformer import (
+    RMSNorm, PatchTransformerBlock, precompute_freqs_cis_3d,
+)
 from src.utils.octree_ops import get_node_xyz, get_split_labels
 
 
@@ -27,35 +30,72 @@ from src.utils.octree_ops import get_node_xyz, get_split_labels
 # ---------------------------------------------------------------------------
 
 class VQHead(nn.Module):
-    """在最终深度预测 BSQ（二值球面量化）编码。
+    """在最终深度预测 BSQ 编码（OctFormer 风格 attention）。
 
-    每个 depth_stop 处的叶子节点需要一个 VQ 编码来描述其局部几何。
-    对于 BSQ（D 组），编码是 D 个独立的二值 → D × 2 类交叉熵损失。
+    和 OctreeAR 一样用 PatchTransformerBlock 做节点间 attention，
+    让叶子节点能利用邻居信息预测局部几何编码。
+    这比纯 MLP 更接近 OctGPT 的做法——OctGPT 的 VQ 预测
+    也是在 attention 特征上做的。
 
     参数:
-        embed_dim: 内部特征维度
+        embed_dim: 内部嵌入维度
         cond_dim_in: 条件输入维度
-        vq_groups: BSQ 量化组数（从 VQVAEWrapper 获取）
+        vq_groups: BSQ 量化组数
+        num_blocks: attention block 数（轻量，4 层）
+        patch_size: patch 注意力大小
+        dilation: 膨胀率
+        attn_drop, proj_drop: dropout
     """
 
     def __init__(self, embed_dim: int = 128, cond_dim_in: int = 512,
-                 vq_groups: int = 64):
+                 vq_groups: int = 64, num_blocks: int = 4,
+                 patch_size: int = 1024, dilation: int = 4,
+                 attn_drop: float = 0.1, proj_drop: float = 0.1,
+                 buffer_size: int = 64, num_iters: int = 256,
+                 start_temperature: float = 0.5, remask_stage: float = 0.7,
+                 random_flip: float = 0.1):
         super().__init__()
         self.vq_groups = vq_groups
-        self.vq_size = 2  # BSQ: 每组二值化
+        self.vq_size = 2
+        self.embed_dim = embed_dim
+        self.n_head = max(2, embed_dim // 32)  # head_dim=32
+        self.patch_size = patch_size
+        self.dilation = dilation
+        self.buffer_size = buffer_size
+        self.num_iters = num_iters
+        self.start_temperature = start_temperature
+        self.remask_stage = remask_stage
+        self.random_flip = random_flip
 
+        # 嵌入
         self.cond_proj = nn.Linear(cond_dim_in, embed_dim, bias=True)
         self.pos_emb = nn.Linear(3, embed_dim, bias=True)
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.token_ln = RMSNorm(embed_dim, eps=1e-5)
 
-        # 轻量 MLP: 位置 + 条件 → 每组的 VQ logits
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, self.vq_groups * self.vq_size),
-        )
+        # OctFormer 风格 patch attention blocks（轻量）
+        self.blocks = nn.ModuleList()
+        for i in range(num_blocks):
+            block_dilation = 1 if (i % 2 == 0) else dilation
+            blk = PatchTransformerBlock(
+                dim=embed_dim,
+                n_head=max(2, embed_dim // 32),  # head_dim=32
+                patch_size=patch_size,
+                dilation=block_dilation,
+                mlp_drop=proj_drop,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+            )
+            self.blocks.append(blk)
+        self.norm = RMSNorm(embed_dim, eps=1e-5)
+
+        # VQ 输出头
+        self.vq_head = nn.Linear(embed_dim, vq_groups * self.vq_size, bias=True)
+
+        # MaskGIT: mask token + vq_proj（BSQ code → embedding）
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+        self.vq_proj = nn.Linear(vq_groups, embed_dim, bias=True)
+        nn.init.normal_(self.mask_token, std=0.02)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -67,51 +107,171 @@ class VQHead(nn.Module):
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            if m.bias is not None:
+        elif isinstance(m, (nn.LayerNorm, RMSNorm)):
+            if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-            if m.weight is not None:
+            if hasattr(m, 'weight') and m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
+
+    def _build_tokens(self, xyz, cond, batch_ids):
+        """构建 Morton 序 token（与 OctreeAR 相同逻辑）。"""
+        N = xyz.shape[0]
+        sort_idx, unsort_idx = self._morton_sort(xyz, batch_ids)
+
+        xyz_m = xyz[sort_idx, :]
+        cond_m = cond[sort_idx, :]
+
+        pos = self.pos_emb(xyz_m.float())
+        c = self.cond_proj(cond_m)
+        tokens = self.token_ln(pos + c)       # (N, embed_dim)
+        tokens = tokens.unsqueeze(0)          # (1, N, embed_dim)
+        xyz_m = xyz_m.unsqueeze(0)            # (1, N, 3)
+        return tokens, xyz_m, sort_idx, unsort_idx
+
+    def _morton_sort(self, xyz, batch_ids):
+        """Morton 排序（含 batch 分块）。"""
+        from src.utils.octree_ops import morton_encode_3d
+        N = xyz.shape[0]
+        device = xyz.device
+        codes = morton_encode_3d(xyz[:, 0], xyz[:, 1], xyz[:, 2])
+        codes = codes + batch_ids.long() * (codes.max() + 1)
+        sort_idx = torch.argsort(codes)
+        unsort_idx = torch.empty_like(sort_idx)
+        unsort_idx[sort_idx] = torch.arange(N, device=device)
+        return sort_idx, unsort_idx
+
+    def _forward_transformer(self, x, xyz=None):
+        """RoPE 频率一次性预计算，传给所有 block 复用。"""
+        freqs_cis = None
+        if xyz is not None:
+            B, N, _ = x.shape
+            hd = self.embed_dim // self.n_head
+            flat_xyz = xyz.reshape(B * N, 3)
+            freqs_cis = precompute_freqs_cis_3d(flat_xyz, hd)
+        for block in self.blocks:
+            x = block(x, freqs_cis)
+        return self.norm(x)
+
+    def _build_tokens_with_buffer(self, xyz, cond, batch_ids,
+                                  token_features=None, mask=None,
+                                  prefix_tokens=None, prefix_xyz=None):
+        """构建 token（含 buffer + 跨深度 prefix），与 OctreeAR 类似。
+
+        序列布局: [buffer(B*buf) | prefix(N_prev) | tokens(N)]
+        """
+        N = xyz.shape[0]
+        B = int(batch_ids.max().item()) + 1
+        device = xyz.device
+
+        if token_features is None:
+            tokens, xyz_m, sort_idx, unsort_idx = self._build_tokens(
+                xyz, cond, batch_ids)
+        else:
+            sort_idx, unsort_idx = self._morton_sort(xyz, batch_ids)
+            tokens = token_features[sort_idx].unsqueeze(0)
+            xyz_m = xyz[sort_idx].unsqueeze(0)
+
+        if mask is not None:
+            mask_m = mask[sort_idx]
+            tokens[0, mask_m, :] = self.mask_token.to(tokens.dtype)
+
+        buffer_cond = self.cond_proj(cond[:B])
+        buffer = buffer_cond.unsqueeze(1).expand(
+            B, self.buffer_size, -1).reshape(1, B * self.buffer_size, -1)
+        buffer_xyz = torch.zeros(1, B * self.buffer_size, 3, device=device)
+
+        if prefix_tokens is not None:
+            prefix_emb = self.cond_proj(prefix_tokens).unsqueeze(0)
+            prefix_xyz_m = prefix_xyz.unsqueeze(0)
+            tokens = torch.cat([buffer, prefix_emb, tokens], dim=1)
+            xyz_m = torch.cat([buffer_xyz, prefix_xyz_m, xyz_m], dim=1)
+        else:
+            tokens = torch.cat([buffer, tokens], dim=1)
+            xyz_m = torch.cat([buffer_xyz, xyz_m], dim=1)
+        return tokens, xyz_m, sort_idx, unsort_idx
 
     def forward(
         self,
         parent_xyz: torch.Tensor,
         parent_cond: torch.Tensor,
         vq_targets: Optional[torch.Tensor] = None,
+        batch_ids: Optional[torch.Tensor] = None,
+        prefix_tokens: Optional[torch.Tensor] = None,
+        prefix_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """为叶子节点预测 VQ 编码。
+        """训练前向：random masking + buffer + 跨深度 prefix → VQ 预测。
 
-        参数:
-            parent_xyz: (B, Np, 3) depth_stop-1 处的叶子节点坐标
-            parent_cond: (B, Np, cond_dim_in) 每节点条件
-            vq_targets: (nnum, vq_groups) ground-truth BSQ indices (每组 0/1)
-
-        返回:
-            logits: (B*Np, vq_groups, 2) VQ 分类 logits
-            loss: 标量交叉熵损失
+        与 OctGPT 对齐:
+        1. 用 vq_targets 构建 token (vq_proj)
+        2. Random masking + random_flip 增强
+        3. 加 buffer + prefix (上一层 token 特征)
+        4. Attention → vq_head → CE loss（仅 masked 位置）
         """
-        B, Np, _ = parent_xyz.shape
+        N = parent_xyz.shape[0]
         device = parent_xyz.device
-        total_nodes = B * Np
 
-        pos_emb = self.pos_emb(parent_xyz.float())        # (B, Np, embed_dim)
-        cond_emb = self.cond_proj(parent_cond)              # (B, Np, embed_dim)
-        h = self.norm(pos_emb + cond_emb)                   # (B, Np, embed_dim)
-        logits = self.mlp(h)                                # (B, Np, vq_groups*2)
-        logits = logits.view(B, Np, self.vq_groups, self.vq_size)
-        logits_flat = logits.reshape(total_nodes, self.vq_groups, self.vq_size)
+        if batch_ids is None:
+            batch_ids = torch.zeros(N, dtype=torch.long, device=device)
+
+        # Random flip 增强（训练时）
+        if self.training and self.random_flip > 0 and vq_targets is not None:
+            flip = torch.rand_like(vq_targets.float()) < self.random_flip
+            vq_targets_for_token = torch.where(flip, 1 - vq_targets, vq_targets)
+        else:
+            vq_targets_for_token = vq_targets
+
+        # 构建 token: vq_proj(BSQ code → embedding)
+        if vq_targets_for_token is not None:
+            zq = vq_targets_for_token.float() * 2 - 1  # {0,1} → {-1,1}
+            zq = zq * (1.0 / self.vq_groups ** 0.5)
+            token_features = self.vq_proj(zq)  # (N, embed_dim)
+        else:
+            token_features = None
+
+        # Random masking
+        if self.training and vq_targets is not None:
+            mask_ratio = 0.5 + 0.5 * torch.rand(1, device=device).item()
+            num_masked = max(int(N * mask_ratio), 1)
+            orders = torch.randperm(N, device=device)
+            mask = torch.zeros(N, dtype=torch.bool, device=device)
+            mask[orders[:num_masked]] = True
+        else:
+            mask = None
+
+        # 构建含 buffer + prefix 的 token
+        tokens, xyz_m, sort_idx, unsort_idx = self._build_tokens_with_buffer(
+            parent_xyz, parent_cond, batch_ids,
+            token_features=token_features, mask=mask,
+            prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz)
+
+        # Attention
+        x = self._forward_transformer(tokens, xyz_m)
+        B = int(batch_ids.max().item()) + 1
+        prefix_len = prefix_tokens.shape[0] if prefix_tokens is not None else 0
+        x = x[0, B * self.buffer_size + prefix_len:, :]  # (N_morton, dim)
+        x = x[unsort_idx, :]                 # (N, dim)
+
+        logits = self.vq_head(x).view(N, self.vq_groups, self.vq_size)
 
         loss = torch.tensor(0.0, device=device)
-        if vq_targets is not None:
-            targets_flat = vq_targets.reshape(-1, self.vq_groups).long()
-            # 每组独立的 2 类交叉熵
+        if vq_targets is not None and mask is not None:
+            # CE loss 仅在 masked 位置
+            targets_flat = vq_targets[mask].reshape(-1, self.vq_groups).long()
+            logits_masked = logits[mask]
             loss = nn.functional.cross_entropy(
-                logits_flat.reshape(-1, self.vq_size),
+                logits_masked.reshape(-1, self.vq_size),
+                targets_flat.reshape(-1),
+                reduction='mean',
+            )
+        elif vq_targets is not None:
+            targets_flat = vq_targets.reshape(-1, self.vq_groups).long()
+            loss = nn.functional.cross_entropy(
+                logits.reshape(-1, self.vq_size),
                 targets_flat.reshape(-1),
                 reduction='mean',
             )
 
-        return logits_flat, loss
+        return logits, loss
 
     @torch.no_grad()
     def sample(
@@ -119,25 +279,68 @@ class VQHead(nn.Module):
         parent_xyz: torch.Tensor,
         parent_cond: torch.Tensor,
         temperature: float = 1.0,
+        batch_ids: Optional[torch.Tensor] = None,
+        prefix_tokens: Optional[torch.Tensor] = None,
+        prefix_xyz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """在最终深度采样 VQ indices。
+        """MaskGIT 迭代生成 VQ indices（支持跨深度 prefix）。"""
+        import math
+        N = parent_xyz.shape[0]
+        device = parent_xyz.device
+        if batch_ids is None:
+            batch_ids = torch.zeros(N, dtype=torch.long, device=device)
 
-        返回:
-            indices: (nnum, vq_groups) 预测的 BSQ indices {0, 1}
-        """
-        logits, _ = self.forward(parent_xyz, parent_cond)
+        # 初始: 全部 masked
+        vq_indices_d = -1 * torch.ones(N, self.vq_groups, device=device).long()
+        token_features = self.mask_token.expand(N, -1).clone()
+        mask_d = torch.ones(N, dtype=torch.bool, device=device)
+        orders = torch.randperm(N, device=device)
 
-        # 温度缩放
-        logits = logits / temperature
+        prefix_len = prefix_tokens.shape[0] if prefix_tokens is not None else 0
 
-        # 按组采样（2 类 categorical）
-        probs = torch.softmax(logits, dim=-1)              # (nnum, vq_groups, 2)
-        indices = torch.multinomial(
-            probs.reshape(-1, self.vq_size), num_samples=1
-        ).squeeze(-1)                                      # (nnum * vq_groups,)
-        indices = indices.reshape(-1, self.vq_groups)      # (nnum, vq_groups)
+        for i in range(self.num_iters):
+            tokens, xyz_m, sort_idx, unsort_idx = self._build_tokens_with_buffer(
+                parent_xyz, parent_cond, batch_ids,
+                token_features=token_features, mask=mask_d,
+                prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz)
 
-        return indices
+            x = self._forward_transformer(tokens, xyz_m)
+            B = int(batch_ids.max().item()) + 1
+            x = x[0, B * self.buffer_size + prefix_len:, :]
+            x = x[unsort_idx, :]
+
+            logits = self.vq_head(x).view(N, self.vq_groups, self.vq_size)
+
+            # 余弦 mask 调度
+            mask_ratio = math.cos(math.pi / 2. * (i + 1) / self.num_iters)
+            mask_len = max(1, min(int(mask_d.sum().item()) - 1,
+                                  int(N * mask_ratio)))
+            mask_next = torch.zeros(N, dtype=torch.bool, device=device)
+            mask_next[orders[:mask_len]] = True
+
+            if i >= self.num_iters - 1:
+                mask_to_pred = mask_d
+            else:
+                mask_to_pred = mask_d & ~mask_next
+            mask_d = mask_next
+
+            # 温度衰减
+            temp = self.start_temperature * ((self.num_iters - i) / self.num_iters)
+
+            # 在 mask_to_pred 位置采样
+            probs = torch.softmax(
+                logits[mask_to_pred] / temp, dim=-1)  # (M, vq_groups, 2)
+            sampled = torch.multinomial(
+                probs.reshape(-1, self.vq_size), 1
+            ).squeeze(-1).reshape(-1, self.vq_groups)
+            vq_indices_d[mask_to_pred] = sampled
+
+            # 更新 token
+            zq = sampled.float() * 2 - 1
+            zq = zq * (1.0 / self.vq_groups ** 0.5)
+            token_features[mask_to_pred] = self.vq_proj(zq)
+
+        return vq_indices_d
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +409,10 @@ class OctreeFractalGen(nn.Module):
                 attn_drop=config.attn_drop,
                 proj_drop=config.proj_drop,
                 grad_checkpointing=config.grad_checkpointing,
+                buffer_size=config.buffer_size,
+                num_iters=config.num_iters[idx],
+                start_temperature=config.start_temperature[idx],
+                remask_stage=config.remask_stage,
             )
         else:
             self.generator = None
@@ -225,6 +432,16 @@ class OctreeFractalGen(nn.Module):
                 embed_dim=config.embed_dims[-1],
                 cond_dim_in=config.cond_embed_dim,
                 vq_groups=vq_groups,
+                num_blocks=4,
+                patch_size=config.patch_size,
+                dilation=config.dilation,
+                attn_drop=config.attn_drop,
+                proj_drop=config.proj_drop,
+                buffer_size=config.buffer_size,
+                num_iters=config.num_iters[-1],
+                start_temperature=config.start_temperature[-1],
+                remask_stage=config.remask_stage,
+                random_flip=config.random_flip,
             )
 
     # ------------------------------------------------------------------
@@ -247,10 +464,20 @@ class OctreeFractalGen(nn.Module):
             )
         return class_embedding
 
-    def _make_per_node_cond(self, global_cond, nnum, B):
-        """将全局条件扩展到每节点。"""
-        Np = nnum // B
-        return global_cond.unsqueeze(1).expand(B, Np, -1)
+    def _make_per_node_cond(self, global_cond, batch_ids, nnum):
+        """将全局条件按 batch 归属展开到每个节点（OctGPT 风格）。
+
+        支持稀疏八叉树（每个 shape 的节点数不同）。
+
+        参数:
+            global_cond: (B, cond_dim) 全局条件
+            batch_ids: (nnum,) 每个节点的 batch 索引
+            nnum: 总节点数
+
+        返回:
+            per_node_cond: (nnum, cond_dim) 每节点条件
+        """
+        return global_cond[batch_ids]  # (nnum, cond_dim)
 
     # ------------------------------------------------------------------
     # 训练前向传播
@@ -272,11 +499,16 @@ class OctreeFractalGen(nn.Module):
         class_cond = self._get_class_condition(octree, labels)
         return self._forward_level(octree, class_cond)
 
-    def _forward_level(self, octree, global_cond) -> torch.Tensor:
+    def _forward_level(self, octree, global_cond,
+                       prefix_tokens=None, prefix_xyz=None) -> torch.Tensor:
         """通过一个递归层级做前向传播。
 
-        AR 层: 预测 split（8-way 占用率的 BCE）。
-        终端层: 预测 VQ 编码（BSQ indices 的交叉熵）。
+        跨深度 token 交互: 每层 AR 的 cond_out + parent_xyz 作为
+        下一层的 prefix，让下一层 token 能 attend 到上一层节点特征
+        （而非只收到标量条件），对齐 OctGPT 的跨深度 attention。
+
+        AR 层: OctFormer 并行预测 split（BCE）。
+        终端层: VQHead 预测 VQ 编码（BSQ indices 的交叉熵）。
         """
         B = octree.batch_size
         device = octree.device
@@ -284,20 +516,27 @@ class OctreeFractalGen(nn.Module):
         if self.is_ar:
             # --- AR 层: split 预测 ---
             depth = self.current_depth
-            parent_xyz, _ = get_node_xyz(octree, depth)
+            parent_xyz, batch_ids = get_node_xyz(octree, depth)
             nnum = octree.nnum[depth]
             if nnum == 0:
                 return torch.tensor(0.0, device=device)
 
-            Np = nnum // B
-            parent_xyz_3d = parent_xyz.view(B, Np, 3)
-            parent_cond = self._make_per_node_cond(global_cond, nnum, B)
+            # 每节点条件（按 batch 归属展开）
+            parent_cond = self._make_per_node_cond(
+                global_cond, batch_ids, nnum)  # (nnum, cond_dim)
 
-            gt_labels = get_split_labels(octree, depth).view(B, Np, 8)
-            _, _, level_loss = self.generator(
-                parent_xyz_3d, parent_cond, gt_labels)
+            # ground-truth split 标签: (nnum, 8)
+            gt_labels = get_split_labels(octree, depth)
 
-            deeper_loss = self.next_fractal._forward_level(octree, global_cond)
+            # AR 前向（展平输入 + batch_ids + 跨深度 prefix）
+            _, cond_out, level_loss = self.generator(
+                parent_xyz, parent_cond, gt_labels, batch_ids,
+                prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz)
+
+            # cond_out + parent_xyz 传给下一层作为 prefix（跨深度 token 交互）
+            deeper_loss = self.next_fractal._forward_level(
+                octree, global_cond,
+                prefix_tokens=cond_out, prefix_xyz=parent_xyz)
             return level_loss + deeper_loss
 
         else:
@@ -306,18 +545,19 @@ class OctreeFractalGen(nn.Module):
                 raise RuntimeError("终端层训练需要 vqvae_wrapper")
 
             final_depth = self.config.depth_stop
-            leaf_xyz, _ = get_node_xyz(octree, final_depth)
+            leaf_xyz, leaf_batch_ids = get_node_xyz(octree, final_depth)
             nnum_leaf = octree.nnum[final_depth]
             if nnum_leaf == 0:
                 return torch.tensor(0.0, device=device)
 
-            Np_final = nnum_leaf // B
-            leaf_xyz_3d = leaf_xyz.view(B, Np_final, 3)
-            leaf_cond = self._make_per_node_cond(global_cond, nnum_leaf, B)
+            leaf_cond = self._make_per_node_cond(
+                global_cond, leaf_batch_ids, nnum_leaf)
 
             vq_targets = self.vqvae_wrapper.extract_targets(octree)
+
             _, level_loss = self.next_fractal(
-                leaf_xyz_3d, leaf_cond, vq_targets)
+                leaf_xyz, leaf_cond, vq_targets, leaf_batch_ids,
+                prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz)
 
             return level_loss
 
@@ -349,53 +589,53 @@ class OctreeFractalGen(nn.Module):
 
     @torch.no_grad()
     def _generate_level(self, octree, global_cond, temperature,
-                        cfg_scale, uncond=None):
-        """生成一个八叉树深度并递归。
-
-        AR 层: 采样 split → 展开八叉树 → 递归。
-        终端层: 在 depth_stop 处采样 VQ 编码。
-        """
+                        cfg_scale, uncond=None,
+                        prefix_tokens=None, prefix_xyz=None):
+        """生成一个八叉树深度并递归（含跨深度 prefix）。"""
         B = octree.batch_size
 
         if self.is_ar:
-            # --- AR 层: 采样 split, 展开八叉树 ---
+            # --- AR 层: OctFormer 并行采样 split ---
             depth = self.current_depth
-            parent_xyz, _ = get_node_xyz(octree, depth)
+            parent_xyz, batch_ids = get_node_xyz(octree, depth)
             nnum = octree.nnum[depth]
             if nnum == 0:
                 return octree, None
 
-            Np = nnum // B
-            parent_xyz_3d = parent_xyz.view(B, Np, 3)
-            parent_cond = self._make_per_node_cond(global_cond, nnum, B)
+            parent_cond = self._make_per_node_cond(
+                global_cond, batch_ids, nnum)
 
-            child_8way, _ = self.generator.sample(
-                parent_xyz_3d, parent_cond, temperature,
+            # OctFormer 采样（展平输入 + batch_ids + 跨深度 prefix）
+            child_8way, cond_out = self.generator.sample(
+                parent_xyz, parent_cond, batch_ids, temperature,
+                prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz,
             )
+
             # 任一子节点被占据 → 分裂父节点
-            split_label = child_8way.any(dim=-1).long().reshape(B * Np)
+            split_label = child_8way.any(dim=-1).long()
             octree.octree_split(split_label, depth=depth)
             octree.octree_grow(depth + 1)
 
+            # cond_out + parent_xyz 传给下一层
             return self.next_fractal._generate_level(
                 octree, global_cond, temperature, cfg_scale, uncond,
+                prefix_tokens=cond_out, prefix_xyz=parent_xyz,
             )
 
         else:
             # --- 终端层: 在 depth_stop 处采样 VQ 编码 ---
             final_depth = self.config.depth_stop
-            leaf_xyz, _ = get_node_xyz(octree, final_depth)
+            leaf_xyz, leaf_batch_ids = get_node_xyz(octree, final_depth)
             nnum_leaf = octree.nnum[final_depth]
             if nnum_leaf == 0:
                 return octree, None
 
-            Np_leaf = nnum_leaf // B
-            leaf_xyz_3d = leaf_xyz.view(B, Np_leaf, 3)
-            leaf_cond = self._make_per_node_cond(global_cond, nnum_leaf, B)
+            leaf_cond = self._make_per_node_cond(
+                global_cond, leaf_batch_ids, nnum_leaf)
 
             vq_indices = self.next_fractal.sample(
-                leaf_xyz_3d, leaf_cond, temperature,
-            )
+                leaf_xyz, leaf_cond, temperature, leaf_batch_ids,
+                prefix_tokens=prefix_tokens, prefix_xyz=prefix_xyz)
             return octree, vq_indices
 
 

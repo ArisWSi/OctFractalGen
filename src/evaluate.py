@@ -156,11 +156,17 @@ def generate_mesh_batch(
                 ), axis=-1).reshape(-1, 3)
                 coords_t = torch.from_numpy(coords).float()
 
+                # 获取设备，将查询点移到同一设备
+                vae_device = next(vqvae_wrapper.vqvae.parameters()).device
+                coords_t = coords_t.to(vae_device)
+
                 sdf_values = []
                 chunk_size = 64 ** 3
                 for i in range(0, len(coords_t), chunk_size):
                     chunk = coords_t[i:i + chunk_size]
-                    sdf_chunk = neural_mpu(chunk)
+                    idx = torch.zeros(chunk.shape[0], 1, device=chunk.device)
+                    pts = torch.cat([chunk, idx], dim=1)
+                    sdf_chunk = neural_mpu(pts)
                     sdf_values.append(
                         sdf_chunk.cpu().numpy() if torch.is_tensor(sdf_chunk)
                         else np.array(sdf_chunk))
