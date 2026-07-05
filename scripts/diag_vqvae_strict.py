@@ -38,25 +38,15 @@ from src.utils.mesh import assert_mesh_scale
 
 def export_autoencoder_recon(vqvae, vqvae_wrapper, octree_gt, output_path,
                              resolution=128, sdf_scale=0.9, points_scale=1.0):
-    """Baseline A: VQVAE autoencoder reconstruction (官方 main_vae.py 路径).
+    """Baseline A: VQVAE autoencoder reconstruction (官方 main_vae.py eval_step).
 
-    官方 VAE test: octree_in = GT (depth8), octree_out 初始化为只到 full_depth,
-    然后 update_octree=True 让 decoder 自己预测 split 结构.
-    这是 VQVAE 的完整 encode+decode, 不做 split_zero.
+    官方 eval_step:
+        octree_in = batch['octree_in']  (= octree_gt when distort=False)
+        octree_out = OctreeD(octree_in)  # 直接包装完整 octree
+        output = vqvae(octree_in, octree_out, update_octree=True)
+        create_mesh(output['neural_mpu'], ...)
     """
-    import ocnn
-    # octree_in = GT depth8 (encode 用)
-    doctree_in = OctreeD(octree_gt)
-    # octree_out 初始化为只到 full_depth (对齐官方 main_vae.py: OctreeD(octree_in) 但实际只 grow 到 full_depth)
-    # 官方 _init_octree_out: init_octree(full_depth, full_depth, ...) → OctreeD(octree_out, full_depth)
-    octree_out = ocnn.octree.init_octree(
-        depth=octree_gt.full_depth,
-        full_depth=octree_gt.full_depth,
-        batch_size=octree_gt.batch_size,
-        device=octree_gt.device,
-    )
-    doctree_out = OctreeD(octree_out)
-    # VQVAE 完整 forward (encode + decode, update_octree=True 让 decoder 预测 split)
+    doctree_out = OctreeD(octree_gt)
     output = vqvae(octree_gt, doctree_out, update_octree=True)
 
     octgpt_utils.create_mesh(
