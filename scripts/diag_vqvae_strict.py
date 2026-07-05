@@ -109,6 +109,12 @@ def mesh_stats(path):
             'bounds': m.bounds.tolist() if v > 0 else None}
 
 
+def print_octree_nnum(tag, octree):
+    """打印 octree 各 depth 的 nnum, 用于检测 in-place 污染."""
+    nnum = [int(octree.nnum[d]) for d in range(3, min(octree.depth + 1, 9))]
+    print(f"  {tag} nnum d3-8: {nnum}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resolution', type=int, default=128)
@@ -142,15 +148,19 @@ def main():
 
     for i in range(min(args.num_samples, len(ds))):
         batch = coll([ds[i]])
-        octree_gt = batch['octree_gt'].to(device)
+        octree_gt_raw = batch['octree_gt'].to(device)
         print(f"=== sample {i} ===")
-        for d in range(3, 9):
-            print(f"  nnum[{d}] = {octree_gt.nnum[d]}")
+        print_octree_nnum("  原始", octree_gt_raw)
 
-        # Baseline A: autoencoder reconstruction
+        # 每个 baseline 用独立 deepcopy, 防止 in-place 污染
+        import copy
+
+        # Baseline A: autoencoder reconstruction (官方 eval_step)
         path_a = f'logs/vqvae_strict_diag/autoencoder_{i:02d}.obj'
+        octree_a = copy.deepcopy(octree_gt_raw)
+        print_octree_nnum("  A 前", octree_a)
         try:
-            export_autoencoder_recon(vqvae, vw, octree_gt, path_a,
+            export_autoencoder_recon(vqvae, vw, octree_a, path_a,
                                      resolution=args.resolution)
             assert_mesh_scale(path_a)
             sa = mesh_stats(path_a)
@@ -158,11 +168,14 @@ def main():
         except Exception as e:
             print(f"  [A] autoencoder FAILED: {e}")
             sa = {'v': 0, 'f': 0, 'area': 0.0}
+        print_octree_nnum("  A 后", octree_a)
 
-        # Baseline B: GT-code generation-path
+        # Baseline B: GT-code generation-path (独立 deepcopy)
         path_b = f'logs/vqvae_strict_diag/gtcode_genpath_{i:02d}.obj'
+        octree_b = copy.deepcopy(octree_gt_raw)
+        print_octree_nnum("  B 前", octree_b)
         try:
-            export_gt_code_gen_path(vw, octree_gt, path_b,
+            export_gt_code_gen_path(vw, octree_b, path_b,
                                     resolution=args.resolution)
             assert_mesh_scale(path_b)
             sb = mesh_stats(path_b)
