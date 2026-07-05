@@ -194,3 +194,28 @@ def extract_mesh_from_octree(octree, depth: int, output_path: str,
         raise ValueError(f"未知方法: {method}")
 
     save_mesh(verts, faces, output_path, scale=scale)
+
+
+def assert_mesh_scale(path, max_abs=5.0):
+    """检查 mesh 坐标范围是否合理 (防止 marching cubes 坐标缩放 bug).
+
+    正常坐标应在 [-0.9, 0.9] 或 [-1, 1] 附近.
+    若 absmax > max_abs, 说明坐标缩放有 bug.
+    """
+    import trimesh
+    import numpy as np
+
+    mesh = trimesh.load(path, force='mesh')
+    if len(mesh.vertices) == 0:
+        print(f"[WARN] empty mesh: {path}")
+        return
+
+    absmax = float(np.abs(mesh.vertices).max())
+    print(f"[MESH] {path}: v={len(mesh.vertices)} f={len(mesh.faces)} "
+          f"bounds={mesh.bounds} absmax={absmax:.4f}")
+
+    if absmax > max_abs:
+        raise RuntimeError(
+            f"Mesh coordinate scale error: {path}, absmax={absmax} "
+            f"(should be < {max_abs}). Likely marching_cubes index "
+            f"coordinates were not normalized.")

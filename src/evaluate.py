@@ -144,46 +144,10 @@ def generate_mesh_batch(
 
         try:
             if vqvae_wrapper is not None:
-                # Neural MPU → Marching Cubes
-                neural_mpu = vqvae_wrapper.decode_to_mpu(vq_indices, octree)
-
-                size = resolution
-                coords = np.stack(np.meshgrid(
-                    np.linspace(-0.9, 0.9, size),
-                    np.linspace(-0.9, 0.9, size),
-                    np.linspace(-0.9, 0.9, size),
-                    indexing='ij',
-                ), axis=-1).reshape(-1, 3)
-                coords_t = torch.from_numpy(coords).float()
-
-                # 获取设备，将查询点移到同一设备
-                vae_device = next(vqvae_wrapper.vqvae.parameters()).device
-                coords_t = coords_t.to(vae_device)
-
-                sdf_values = []
-                chunk_size = 64 ** 3
-                for i in range(0, len(coords_t), chunk_size):
-                    chunk = coords_t[i:i + chunk_size]
-                    idx = torch.zeros(chunk.shape[0], 1, device=chunk.device)
-                    pts = torch.cat([chunk, idx], dim=1)
-                    sdf_chunk = neural_mpu(pts)
-                    sdf_values.append(
-                        sdf_chunk.cpu().numpy() if torch.is_tensor(sdf_chunk)
-                        else np.array(sdf_chunk))
-                sdf = np.concatenate(sdf_values, axis=0).reshape(size, size, size)
-
-                verts, faces = marching_cubes(sdf, level=0.002)
-
-                if len(verts) > 0 and len(faces) > 0:
-                    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-                    components = mesh.split(only_watertight=True)
-                    if len(components) > 0:
-                        mesh = trimesh.util.concatenate(components)
-                        mesh.export(output_path)
-                    else:
-                        save_mesh(verts, faces, output_path, scale=1.0)
-                else:
-                    save_mesh(verts, faces, output_path, scale=1.0)
+                # 复用 generate.py 的官方 create_mesh 路径 (统一导出逻辑)
+                from src.generate import export_mesh_vqvae
+                export_mesh_vqvae(vqvae_wrapper, octree, vq_indices,
+                                  output_path, resolution=resolution)
             else:
                 # Fallback: direct voxel extraction
                 from src.utils.mesh import extract_mesh_from_octree
