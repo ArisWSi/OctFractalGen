@@ -44,6 +44,7 @@ from src.config import (
 )
 from src.model.fractal_octree import OctreeFractalGen
 from src.model.fractal_octgpt import FractalOctGPT
+from src.model.grouped_fractal_octgpt import CoarseFineOctGPT
 from src.model.vqvae_wrapper import VQVAEWrapper
 
 # 复用 train.py 的工具函数
@@ -88,9 +89,13 @@ def train_one_epoch_ddp(
 
     for batch in pbar:
         lr_idx = global_step
+        # 分组 LR: 不覆盖分组 lr, 而是按 base_lr 比例缩放 (支持 constant + cosine)
         if lr_idx < len(lr_schedule):
+            scale = lr_schedule[lr_idx] / config.train.lr if config.train.lr > 0 else 1.0
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr_schedule[lr_idx]
+                base = param_group.get('base_lr', param_group['lr'])
+                param_group['base_lr'] = base
+                param_group['lr'] = base * scale
 
         if 'octree_gt' in batch:
             octree = batch['octree_gt'].to(device)
@@ -126,14 +131,44 @@ def train_one_epoch_ddp(
         num_batches += 1
 
         if rank == 0:
-            pbar.set_postfix({
+            # 分层诊断日志 (指南第8节): 若模型提供 get_last_diag 则记录 per-depth 指标
+            diag = {}
+            raw_model = model.module if isinstance(model, DDP) else model
+            if hasattr(raw_model, 'get_last_diag'):
+                diag = raw_model.get_last_diag()
+            postfix = {
                 'loss': f'{loss_val:.4f}',
                 'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-            })
+            }
+            if 'loss_coarse' in diag:
+                postfix['c'] = f"{diag['loss_coarse']:.3f}"
+            if 'loss_fine' in diag:
+                postfix['f'] = f"{diag['loss_fine']:.3f}"
+            if 'vq_top1' in diag:
+                postfix['vq'] = f"{diag['vq_top1']:.2f}"
+            pbar.set_postfix(postfix)
             if global_step % config.log_interval == 0 and writer is not None:
                 writer.add_scalar('train/loss', loss_val, global_step)
                 writer.add_scalar('train/lr',
                                   optimizer.param_groups[0]['lr'], global_step)
+                # per-depth 分层指标 (指南第1-3节)
+                for k, v in diag.items():
+                    if isinstance(v, (int, float)):
+                        writer.add_scalar(f'train/{k}', v, global_step)
+                # 梯度范数 (指南第10节, 每 log_interval 记录)
+                from src.utils.train_metrics import compute_grad_norm
+                grad_norms = compute_grad_norm(raw_model, {
+                    'coarse': 'coarse.',
+                    'fine': 'fine.',
+                    'prefix': 'prefix_',
+                })
+                for k, v in grad_norms.items():
+                    writer.add_scalar(f'train/grad_norm_{k}', v, global_step)
+                # GPU 显存
+                mem_alloc = torch.cuda.memory_allocated() / 1e9
+                mem_reserved = torch.cuda.memory_reserved() / 1e9
+                writer.add_scalar('system/gpu_mem_allocated_gb', mem_alloc, global_step)
+                writer.add_scalar('system/gpu_mem_reserved_gb', mem_reserved, global_step)
         global_step += 1
 
     # 汇总各 rank 的平均损失
@@ -174,7 +209,7 @@ def validate_ddp(model, dataloader, device, epoch, writer, rank):
 
 
 def save_checkpoint_ddp(model, optimizer, epoch, global_step, scaler,
-                        config, logdir, is_best=False):
+                        config, logdir, is_best=False, model_type=None):
     """保存 checkpoint（仅 rank 0 调用）。"""
     os.makedirs(logdir, exist_ok=True)
     raw = model.module if isinstance(model, DDP) else model
@@ -185,10 +220,14 @@ def save_checkpoint_ddp(model, optimizer, epoch, global_step, scaler,
         'global_step': global_step,
         'scaler': scaler.state_dict() if scaler is not None else None,
         'config': config,
+        'model_type': model_type,
     }
     path = os.path.join(logdir, f'checkpoint_epoch{epoch:03d}.pt')
     torch.save(checkpoint, path)
     logger.info(f"已保存 checkpoint: {path}")
+    # latest.pt (指南第7.4节)
+    latest_path = os.path.join(logdir, 'latest.pt')
+    torch.save(checkpoint, latest_path)
     if is_best:
         best_path = os.path.join(logdir, 'best.pt')
         torch.save(checkpoint, best_path)
@@ -226,8 +265,11 @@ def main():
     parser.add_argument('--no_lr_scale', action='store_true',
                         help='禁用 LR 线性放大（用原始 lr）')
     parser.add_argument('--model', type=str, default='fractal_octgpt',
-                        choices=['fractal_octgpt', 'octree_fractal'],
-                        help='模型架构: fractal_octgpt (复用OctFormer) 或 octree_fractal (旧架构)')
+                        choices=['fractal_octgpt', 'octree_fractal',
+                                 'coarse_fine_octgpt'],
+                        help='模型架构: fractal_octgpt (复用OctFormer), '
+                             'octree_fractal (旧架构), '
+                             'coarse_fine_octgpt (coarse-fine 分组 + prefix)')
     args = parser.parse_args()
 
     # DDP 初始化
@@ -297,6 +339,8 @@ def main():
     if args.model == 'fractal_octgpt':
         model = FractalOctGPT(
             config.model, vqvae_wrapper=vqvae_wrapper, fractal_level=0)
+    elif args.model == 'coarse_fine_octgpt':
+        model = CoarseFineOctGPT(config.model, vqvae_wrapper=vqvae_wrapper)
     else:
         model = OctreeFractalGen(
             config.model, vqvae_wrapper=vqvae_wrapper, fractal_level=0)
@@ -336,7 +380,26 @@ def main():
         logger.info(f"验证集: {len(val_dataset)} 样本")
 
     # 优化器与调度
-    optimizer = create_optimizer(model, config.train)
+    # Plan B: 若模型支持 get_param_groups, 用分组学习率
+    raw_model_for_opt = model.module if isinstance(model, DDP) else model
+    if hasattr(raw_model_for_opt, 'get_param_groups'):
+        param_groups = raw_model_for_opt.get_param_groups()
+        # 应用分组 lr
+        lr_map = {
+            'coarse': getattr(config.model, 'lr_coarse', 0) or config.train.lr,
+            'prefix': getattr(config.model, 'lr_prefix', 0) or config.train.lr,
+            'fine': getattr(config.model, 'lr_fine', 0) or config.train.lr,
+        }
+        for g in param_groups:
+            g['lr'] = lr_map.get(g['name'], config.train.lr)
+            g['weight_decay'] = config.train.weight_decay
+        if rank == 0:
+            for g in param_groups:
+                n = sum(p.numel() for p in g['params'])
+                logger.info(f"  param group '{g['name']}': {n:,} params, lr={g['lr']:.2e}")
+        optimizer = torch.optim.AdamW(param_groups, betas=config.train.betas)
+    else:
+        optimizer = create_optimizer(model, config.train)
     scaler = torch.cuda.amp.GradScaler() if config.train.use_amp else None
     lr_schedule = cosine_scheduler(
         config.train.lr, config.train.warmup_epochs,
@@ -378,7 +441,7 @@ def main():
                           epoch == config.train.max_epoch - 1):
             save_checkpoint_ddp(
                 model, optimizer, epoch, global_step, scaler, config,
-                config.train.logdir, is_best=is_best)
+                config.train.logdir, is_best=is_best, model_type=args.model)
 
         dist.barrier()
 

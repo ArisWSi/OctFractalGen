@@ -134,10 +134,6 @@ class OctGPTLayer(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, num_embed))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # CLS token: 作为 buffer 第一个位置，聚合序列信息供下一层使用
-        self.cls_token = nn.Parameter(torch.zeros(1, num_embed))
-        nn.init.normal_(self.cls_token, std=0.02)
-
         # Encoder / Decoder（对半分，OctGPT 风格）
         self.encoder = OctFormer(
             channels=num_embed, num_heads=num_heads,
@@ -203,16 +199,10 @@ class OctGPTLayer(nn.Module):
         return x
 
     def add_buffer(self, x, mask, cond):
-        """在序列前加条件 buffer（每 batch 项 buffer_size 个）。
-
-        布局: [CLS(1) | cond_buffer(buf-1) | tokens(N)] × B
-        CLS token 占每 batch buffer 的第一个位置，用于聚合序列信息。
-        """
+        """在序列前加条件 buffer（每 batch 项 buffer_size 个）。"""
         batch_size = cond.shape[0]
-        # CLS token (可学习) + cond 填充剩余 buffer
-        cls = self.cls_token.expand(batch_size, 1, -1)  # (B, 1, dim)
-        cond_buf = cond.unsqueeze(1).repeat(1, self.buffer_size - 1, 1)  # (B, buf-1, dim)
-        buffer = torch.cat([cls, cond_buf], dim=1).reshape(-1, self.num_embed)  # (B*buf, dim)
+        buffer = cond.reshape(batch_size, 1, -1)
+        buffer = buffer.repeat(1, self.buffer_size, 1).reshape(-1, self.num_embed)
         mask_buffer = torch.zeros(buffer.shape[0], device=x.device).bool()
         x = torch.cat([buffer, x], dim=0)
         mask = torch.cat([mask_buffer, mask], dim=0)
@@ -314,12 +304,10 @@ class OctGPTLayer(nn.Module):
 
         # OctFormer encoder-decoder
         x_out = self.forward_model(x, octree, depth, mask, cond)
-        # 提取 CLS token 输出（每 batch buffer 的第一个位置）→ 下一层 cond
-        B = octree.batch_size
-        cls_out = x_out[::self.buffer_size][:B]  # (B, dim)
         # 去 buffer → 当前深度节点输出
+        B = octree.batch_size
         x_node = x_out[B * self.buffer_size:]
-        cond_out = cls_out  # CLS 聚合特征，供下一层 cond
+        cond_out = x_node  # (nnum, dim) 供下一层 mean pool
 
         # 计算 loss（仅 masked 位置）
         diag = {}
@@ -414,7 +402,6 @@ class OctGPTLayer(nn.Module):
             x, mask_all = self.add_buffer(token_emb_masked, mask_d, cond)
             x_out = self.forward_model(x, octree, depth, mask_all, cond)
             B = octree.batch_size
-            cls_out = x_out[::self.buffer_size][:B]  # CLS 输出
             x_node = x_out[B * self.buffer_size:]
 
             mask_ratio = np.cos(math.pi / 2. * (i + 1) / num_iters)
@@ -454,7 +441,7 @@ class OctGPTLayer(nn.Module):
                 split_d[mask_to_pred] = ix.long()
                 token_emb[mask_to_pred] = self.split_emb(ix)
 
-        cond_out = cls_out  # CLS 聚合特征
+        cond_out = x_node  # 最后一轮的节点输出
         if self.is_vq:
             return vq_indices_d, cond_out
         else:

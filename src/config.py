@@ -59,6 +59,19 @@ class ModelConfig:
     num_iters: Tuple[int, ...] = (64, 128, 128, 256)
     start_temperature: Tuple[float, ...] = (1.0, 1.2, 0.5, 0.5)
 
+    # ── CoarseFineOctGPT 专用 ─────────────────────────────────
+    # coarse/fine 子配置 (dict): {dim, heads, blocks}
+    coarse: dict = None
+    fine: dict = None
+    detach_prefix: bool = False     # True=prefix 不反传到 coarse
+
+    # ── Plan B: 官方 OctGPT 初始化 fine ──────────────────────
+    official_octgpt_ckpt: str = ""  # 官方 OctGPT checkpoint 路径
+    finetune: dict = None           # {stage, freeze_fine, freeze_coarse, ...}
+    lr_coarse: float = 0.0          # 分组学习率 (0=用 train.lr)
+    lr_prefix: float = 0.0
+    lr_fine: float = 0.0
+
 
 @dataclass
 class VQVAEConfig:

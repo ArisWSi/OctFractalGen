@@ -41,8 +41,10 @@ def octree_to_voxel(octree, depth: int) -> np.ndarray:
     data = torch.ones(len(batch_id), 1, device=octree.device)
 
     # 散射到稠密网格
+    # octree2voxel 返回 (B, D, D, D, C)，需 permute 到 (B, C, D, D, D)
     data_full = ocnn.nn.octree2voxel(
         data=data, octree=octree, depth=depth, nempty=False)
+    data_full = data_full.permute(0, 4, 1, 2, 3).contiguous()
 
     # 返回第一个 batch 项
     voxel = data_full[0, 0].cpu().numpy()
@@ -52,21 +54,27 @@ def octree_to_voxel(octree, depth: int) -> np.ndarray:
 def marching_cubes(
     voxel: np.ndarray,
     level: float = 0.5,
+    bbmin: float = -0.9,
+    bbmax: float = 0.9,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """使用 Marching Cubes 从体素网格提取 mesh 表面。
 
     参数:
         voxel: (D, D, D) 占用率网格
         level: 等值面阈值
+        bbmin, bbmax: 输出顶点坐标范围 (体素索引 [0,D] -> [bbmin,bbmax])
 
     返回:
-        vertices: (V, 3) 顶点位置
+        vertices: (V, 3) 顶点位置 (已缩放到 [bbmin, bbmax])
         faces: (F, 3) 三角形索引
     """
     from skimage import measure
 
     try:
         verts, faces, _, _ = measure.marching_cubes(voxel, level=level)
+        # 体素索引 [0, D] -> [bbmin, bbmax]
+        D = voxel.shape[0]
+        verts = verts * ((bbmax - bbmin) / D) + bbmin
         return verts, faces
     except (ValueError, RuntimeError):
         # 在该 level 未找到表面

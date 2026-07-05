@@ -1,0 +1,108 @@
+# CoarseFineOctGPT Plan B: 官方 OctGPT 初始化 Fine + Adapter 微调
+#
+# 核心思想:
+#   - Fine 模型加载官方 OctGPT airplane 权重 (24 blocks, 768 dim)
+#   - 只训练 coarse + prefix adapter, 冻结 fine
+#   - 复用官方已学到的 VQ-friendly prior
+#
+# fine 配置必须与官方 OctGPT 一致: dim=768, heads=8, blocks=24, patch_size=2048, dilation=2
+
+experiment:
+  name: coarse_fine_airplane_planb
+  description: "Plan B: official OctGPT init fine + adapter finetune"
+
+model:
+  full_depth: 3
+  depth_stop: 6
+  fractal_levels: [3, 4, 5]
+
+  # Coarse (从零训练)
+  coarse:
+    dim: 576
+    heads: 8
+    blocks: 12
+
+  # Fine (加载官方 OctGPT, 必须与官方一致: 768 dim, 24 blocks)
+  fine:
+    dim: 768
+    heads: 8
+    blocks: 24
+
+  detach_prefix: false
+
+  # Plan B 配置
+  official_octgpt_ckpt: /root/autodl-tmp/OctGPT/octgpt_airplane.pth
+  finetune:
+    stage: adapter_only        # adapter_only | partial_fine | full_fine_low_lr
+    freeze_fine: true
+    freeze_coarse: false
+    train_prefix_proj: true
+    use_align_loss: true
+    align_loss_weight: 0.1
+
+  # MaskGIT 参数 (fine 用官方 num_iters)
+  num_iters: [64, 128, 128, 256]
+  start_temperature: [1.0, 1.2, 0.5, 0.5]
+  buffer_size: 64
+  random_flip: 0.1
+  remask_stage: 0.7
+
+  use_swin: true
+  pos_emb_type: "sin"
+
+  mlp_ratio: 4.0
+  attn_drop: 0.1
+  proj_drop: 0.1
+  drop_path: 0.0
+
+  # 与官方 OctGPT 一致
+  patch_size: 2048
+  dilation: 2
+
+  num_classes: 1
+  label_drop_prob: 0.1
+
+  grad_checkpointing: true
+
+  # Plan B 分组学习率 (在 model 段)
+  lr_coarse: 1.0e-4
+  lr_prefix: 1.0e-4
+  lr_fine: 0.0
+
+vqvae:
+  vae_name: "vqvae_large"
+  ckpt_path: "/root/autodl-tmp/OctGPT/vqvae_large_im5_uncond_bsq32.pth"
+  embedding_channels: 32
+  embedding_sizes: 128
+  quantizer_type: "bsq"
+  quantizer_group: 4
+  feature: "ND"
+  in_channels: 4
+  n_node_type: 7
+  vae_depth: 8
+
+data:
+  location: "/root/autodl-tmp/ShapeNet/processed"
+  filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
+  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
+  depth: 8
+  full_depth: 3
+  points_scale: 1.0
+  batch_size: 4
+  num_workers: 4
+  max_points: 120000
+  distort: false
+
+train:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 3.0
+  max_epoch: 100
+  warmup_epochs: 5
+  use_amp: true
+  log_interval: 50
+  save_interval: 10
+  logdir: "logs/coarse_fine_airplane_planb"
+  device: "cuda"
+  seed: 42

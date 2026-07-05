@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import Config
 from src.model.fractal_octree import OctreeFractalGen
+from src.model.fractal_octgpt import FractalOctGPT
+from src.model.grouped_fractal_octgpt import CoarseFineOctGPT
 from src.model.vqvae_wrapper import VQVAEWrapper
 from src.utils.mesh import marching_cubes, save_mesh
 
@@ -65,16 +67,20 @@ def _load_vqvae(ckpt_path: str, device: torch.device,
 
 
 def load_model(checkpoint_path: str, device: torch.device,
-               vqvae_ckpt_path: Optional[str] = None):
+               vqvae_ckpt_path: Optional[str] = None,
+               model_type: Optional[str] = None):
     """从 checkpoint 加载训练好的模型和 VQ-VAE。
 
     参数:
         checkpoint_path: OctreeFractalGen .pt checkpoint 路径
         device: torch 设备
         vqvae_ckpt_path: VQ-VAE .pt checkpoint 路径（可选，可从 config 读取）
+        model_type: 模型类型 ('fractal_octgpt' | 'octree_fractal' |
+                    'coarse_fine_octgpt'). None=从 checkpoint 推断(默认
+                    octree_fractal 兼容旧 ckpt).
 
     返回:
-        model: 评估模式下的 OctreeFractalGen
+        model: 评估模式下的模型
         vqvae_wrapper: 用于 mesh 解码的 VQVAEWrapper（或 None）
         model_cfg: ModelConfig
     """
@@ -100,15 +106,25 @@ def load_model(checkpoint_path: str, device: torch.device,
             vqvae, model_cfg.depth_stop, model_cfg.full_depth, vae_depth)
         print("VQ-VAE 已加载。")
 
-    # 模型加载
-    model = OctreeFractalGen(
-        model_cfg, vqvae_wrapper=vqvae_wrapper, fractal_level=0)
+    # 模型加载: 根据类型选择
+    if model_type is None:
+        # 从 checkpoint 推断 (新 checkpoint 会保存 model_type)
+        model_type = checkpoint.get('model_type', 'octree_fractal')
+
+    if model_type == 'coarse_fine_octgpt':
+        model = CoarseFineOctGPT(model_cfg, vqvae_wrapper=vqvae_wrapper)
+    elif model_type == 'fractal_octgpt':
+        model = FractalOctGPT(
+            model_cfg, vqvae_wrapper=vqvae_wrapper, fractal_level=0)
+    else:
+        model = OctreeFractalGen(
+            model_cfg, vqvae_wrapper=vqvae_wrapper, fractal_level=0)
     model.load_state_dict(checkpoint['model'])
     model = model.to(device)
     model.eval()
 
     epoch = checkpoint.get('epoch', 'unknown')
-    print(f"已加载 checkpoint，epoch {epoch}")
+    print(f"已加载 checkpoint，epoch {epoch} (model_type={model_type})")
     return model, vqvae_wrapper, model_cfg
 
 
@@ -132,58 +148,33 @@ def generate_one(model, device, batch_size=1, temperature=1.0, cfg_scale=1.0):
 
 
 def export_mesh_vqvae(vqvae_wrapper, octree, vq_indices, output_path,
-                      resolution=256):
-    """通过 VQ-VAE 解码 VQ 编码并用 Marching Cubes 提取 mesh。
+                      resolution=128, sdf_scale=0.9, points_scale=1.0):
+    """通过 VQ-VAE 解码 VQ 编码并用 Marching Cubes 提取 mesh.
 
-    遵循 OctGPT 的 create_mesh 流程:
-    Neural MPU 在稠密网格上求值 → Marching Cubes → OBJ 导出。
+    直接复用官方 OctGPT 的 utils.create_mesh, 保证坐标缩放一致.
     """
-    import trimesh
+    import sys as _sys
+    octgpt_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'extern', 'octgpt',
+    )
+    if octgpt_root not in _sys.path:
+        _sys.path.insert(0, octgpt_root)
+    from utils import utils as octgpt_utils
 
     neural_mpu = vqvae_wrapper.decode_to_mpu(vq_indices, octree)
 
-    # 在稠密网格上求值 Neural MPU
-    size = resolution
-    coords = np.stack(np.meshgrid(
-        np.linspace(-0.9, 0.9, size),
-        np.linspace(-0.9, 0.9, size),
-        np.linspace(-0.9, 0.9, size),
-        indexing='ij',
-    ), axis=-1).reshape(-1, 3)
-    coords_t = torch.from_numpy(coords).float()
-
-    # 获取 VQVAE 所在设备，将查询点移到同一设备
-    device = next(vqvae_wrapper.vqvae.parameters()).device
-    coords_t = coords_t.to(device)
-
-    # 分块求值以避免 OOM
-    sdf_values = []
-    chunk_size = 64 ** 3
-    for i in range(0, len(coords_t), chunk_size):
-        chunk = coords_t[i:i + chunk_size]
-        # NeuralMPU 期望 (N, 4): [xyz, batch_id]，batch_id=0（单形状）
-        idx = torch.zeros(chunk.shape[0], 1, device=chunk.device)
-        pts = torch.cat([chunk, idx], dim=1)
-        sdf_chunk = neural_mpu(pts)
-        sdf_values.append(
-            sdf_chunk.cpu().numpy() if torch.is_tensor(sdf_chunk)
-            else np.array(sdf_chunk))
-    sdf = np.concatenate(sdf_values, axis=0).reshape(size, size, size)
-
-    # Marching Cubes 提取等值面
-    verts, faces = marching_cubes(sdf, level=0.002)
-
-    # 清理: 仅保留水密连通分量（遵循 OctGPT 的 clean=True）
-    if len(verts) > 0 and len(faces) > 0:
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-        components = mesh.split(only_watertight=True)
-        if len(components) > 0:
-            mesh = trimesh.util.concatenate(components)
-            mesh.export(output_path)
-        else:
-            save_mesh(verts, faces, output_path, scale=1.0)
-    else:
-        save_mesh(verts, faces, output_path, scale=1.0)
+    octgpt_utils.create_mesh(
+        neural_mpu,
+        output_path,
+        size=resolution,
+        level=0.002,
+        clean=True,
+        bbmin=-sdf_scale,
+        bbmax=sdf_scale,
+        mesh_scale=points_scale,
+        save_sdf=False,
+    )
 
 
 def main():
@@ -204,6 +195,10 @@ def main():
     parser.add_argument('--method', type=str, default='vqvae',
                         choices=['vqvae', 'voxel'],
                         help='Mesh 提取: vqvae (Neural MPU) 或 voxel (直接八叉树)')
+    parser.add_argument('--model_type', type=str, default=None,
+                        choices=['fractal_octgpt', 'octree_fractal',
+                                 'coarse_fine_octgpt', None],
+                        help='模型类型 (None=从 checkpoint 推断)')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
@@ -217,6 +212,7 @@ def main():
     print(f"从 {args.checkpoint} 加载模型 ...")
     model, vqvae_wrapper, model_cfg = load_model(
         args.checkpoint, device, args.vqvae_ckpt,
+        model_type=args.model_type,
     )
     print(f"模型: full_depth={model_cfg.full_depth}, "
           f"depth_stop={model_cfg.depth_stop}")

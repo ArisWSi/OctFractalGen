@@ -1,0 +1,108 @@
+# OctFractalGen — Coarse-Fine Grouped FractalOctGPT, Airplane category
+#
+# 架构:
+#   Coarse group: depth 3-4 split (联合建模, 共享一个 OctFormer)
+#       ↓ full prefix hidden states (d3+d4 所有 token)
+#   Fine group:   depth 5 split + depth 6 VQ (联合建模, 共享另一个 OctFormer)
+#       conditioned on prefix
+#
+# 核心改进 vs 当前逐层 FractalOctGPT:
+#   - 组内保留 OctGPT 多深度联合建模 (coarse: d3+d4, fine: d5+VQ)
+#   - 组间用 full prefix (所有 coarse hidden) 替代 mean pool / CLS
+#   - prefix 不参与 loss, fine 可 attend prefix, prefix 不能 attend fine
+#     (由 OctreeT 原生 teacher-forcing mask 保证)
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m src.train_ddp \
+#       --config experiments/configs/coarse_fine_octgpt_airplane.yaml \
+#       --model coarse_fine_octgpt
+
+experiment:
+  name: coarse_fine_octgpt_airplane
+  description: "Coarse-Fine Grouped FractalOctGPT with full prefix"
+
+model:
+  full_depth: 3
+  depth_stop: 6
+  fractal_levels: [3, 4, 5]
+
+  # Coarse group (depth 3-4, 全 split)
+  coarse:
+    dim: 576
+    heads: 8
+    blocks: 12
+
+  # Fine group (depth 5 split + depth 6 VQ) — 对齐官方 patch_size/dilation
+  # blocks=12 保持总参数与官方单模型(24b)可比 (coarse 96M + fine 170M ≈ 266M vs 官方 340M)
+  fine:
+    dim: 768
+    heads: 8
+    blocks: 12
+
+  # Prefix 配置
+  detach_prefix: false   # end-to-end: fine loss 通过 prefix 反传更新 coarse
+
+  # MaskGIT 生成参数 (coarse 2 层 + fine 2 层 = 4 个深度)
+  num_iters: [64, 128, 128, 256]
+  start_temperature: [1.0, 1.2, 0.5, 0.5]
+  buffer_size: 64
+  random_flip: 0.1
+  remask_stage: 0.7
+
+  # FractalOctGPT 架构参数 (复用 OctFormer)
+  use_swin: true
+  pos_emb_type: "sin"
+
+  # Shared transformer settings
+  mlp_ratio: 4.0
+  attn_drop: 0.1
+  proj_drop: 0.1
+  drop_path: 0.0
+
+  # Patch attention (OctFormer-style) — 对齐官方
+  patch_size: 2048
+  dilation: 2
+
+  # Condition (unconditional for first run)
+  num_classes: 1
+  label_drop_prob: 0.1
+
+  grad_checkpointing: true
+
+vqvae:
+  vae_name: "vqvae_large"
+  ckpt_path: "/root/autodl-tmp/OctGPT/vqvae_large_im5_uncond_bsq32.pth"
+  embedding_channels: 32
+  embedding_sizes: 128
+  quantizer_type: "bsq"
+  quantizer_group: 4
+  feature: "ND"
+  in_channels: 4
+  n_node_type: 7
+  vae_depth: 8
+
+data:
+  location: "/root/autodl-tmp/ShapeNet/processed"
+  filelist: "/root/autodl-tmp/OctGPT/ShapeNet/train_airplane.txt"
+  val_filelist: "/root/autodl-tmp/OctGPT/ShapeNet/val_airplane.txt"
+  depth: 8
+  full_depth: 3
+  points_scale: 1.0
+  batch_size: 6
+  num_workers: 4
+  max_points: 120000
+  distort: false
+
+train:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.99]
+  grad_clip: 3.0
+  max_epoch: 200
+  warmup_epochs: 2
+  use_amp: true
+  log_interval: 50
+  save_interval: 20
+  logdir: "logs/coarse_fine_octgpt_airplane"
+  device: "cuda"
+  seed: 42
